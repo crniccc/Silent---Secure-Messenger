@@ -8,7 +8,7 @@ const mongoose = require("mongoose");
 const setupSocket = (server) => {
   const io = new Server(server, {
     cors: {
-      origin: "https://192.168.1.85:3000",
+      origin: "http://192.168.1.85:3000",
       methods: ["GET", "POST", "PATCH", "DELETE"],
       credentials: true,
     },

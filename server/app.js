@@ -1,6 +1,5 @@
 const express = require("express");
-const https = require("https");
-const fs = require("fs");
+const http = require("http");
 const connectDB = require("./config/db");
 const userRoutes = require("./routes/users");
 const inviteRoutes = require("./routes/invites");
@@ -13,13 +12,8 @@ require("dotenv").config();
 
 const app = express();
 
-// SSL options
-const options = {
-  key: fs.readFileSync("./ssl/192.168.1.85-key.pem"),
-  cert: fs.readFileSync("./ssl/192.168.1.85.pem"),
-};
-
-const server = https.createServer(options, app);
+// Create HTTP server (no SSL)
+const server = http.createServer(app);
 
 // Socket.io
 const io = setupSocket(server);
@@ -74,7 +68,7 @@ app.use((err, req, res, next) => {
 connectDB()
   .then(() => {
     server.listen(process.env.PORT || 3000, () => {
-      console.log(`HTTPS Server running on port ${process.env.PORT || 3000}`);
+      console.log(`HTTP Server running on port ${process.env.PORT || 3000}`);
     });
   })
   .catch((error) => {

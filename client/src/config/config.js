@@ -8,7 +8,7 @@
 // Note: In React Native, we need to access these directly
 const CONFIG = {
   // API endpoints
-  BACKEND_URL: process.env.REACT_APP_BACKEND_URL || "https://192.168.1.85:3000",
+  BACKEND_URL: process.env.REACT_APP_BACKEND_URL || "http://192.168.1.85:3000",
   ENTROPY_SERVER_URL:
     process.env.REACT_APP_ENTROPY_SERVER_URL || "http://192.168.1.85:5000",
 
