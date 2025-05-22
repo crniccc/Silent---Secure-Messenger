@@ -1,0 +1,14 @@
+.DS_Store
+/node_modules
+/server/node_modules
+*.pem
+*.bak
+*.mobileconfig
+Videos/.gitkeep
+*.mp4
+*.mov
+*.sh
+*.key
+*.crt
+server/.env
+client/.env

@@ -1,0 +1,3214 @@
+import "react-native-get-random-values";
+import React, { useState, useEffect, useRef } from "react";
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  FlatList,
+  StyleSheet,
+  SafeAreaView,
+  StatusBar,
+  Alert,
+  KeyboardAvoidingView,
+  Platform,
+  Image,
+  ActivityIndicator,
+  Linking,
+  Dimensions,
+  useWindowDimensions,
+} from "react-native";
+import * as SecureStore from "expo-secure-store";
+import io from "socket.io-client";
+import axios from "axios";
+import { Ionicons } from "@expo/vector-icons";
+import nacl from "tweetnacl";
+import naclUtil from "tweetnacl-util";
+import { v4 as uuidv4 } from "uuid";
+import * as ImagePicker from "expo-image-picker";
+import * as FileSystem from "expo-file-system";
+import * as ImageManipulator from "expo-image-manipulator";
+import Modal from "react-native-modal";
+import ImageViewer from "react-native-image-zoom-viewer";
+import enhancedRandom from "../utils/EnhancedRandom";
+import * as Permissions from "expo-permissions";
+import CONFIG from "../config/config";
+import messageStatusHandler from "../utils/messageStatusHandler";
+
+// DoubleRatchet class with enhanced security
+class DoubleRatchet {
+  constructor(sharedSecret, chainKey, isInitiator = false, dhKeyPair = null) {
+    this.rootKey = sharedSecret;
+    this.chainKey = chainKey;
+    this.isInitiator = isInitiator;
+    this.dhKeyPair = dhKeyPair; // Will be initialized with enhanced randomness later
+    this.remotePublicKey = null;
+    this.sendingChainKey = null;
+    this.receivingChainKey = null;
+    this.sendingMessageNumber = 0;
+    this.receivingMessageNumber = 0;
+    this.skippedMessageKeys = new Map();
+    this.MAX_SKIP = 100;
+    this.MAX_MESSAGES_BEFORE_DH_RESET = 5; // Reset DH ratchet after 5 messages
+    this.messagesSinceLastReset = 0; // Counter for messages since last DH ratchet
+    this.debug = true;
+    this.useEnhancedRandom = true; // Flag to enable enhanced randomness
+  }
+
+  // Enhanced initialization with stronger randomness
+  async initWithEnhancedRandomness() {
+    if (!this.dhKeyPair && this.useEnhancedRandom) {
+      try {
+        // Use enhanced randomness for the DH key pair
+        this.dhKeyPair = await enhancedRandom.boxKeyPair();
+        this.log("DH Key Pair generated with enhanced randomness");
+      } catch (error) {
+        this.error(
+          "Enhanced randomness failed, falling back to standard randomness:",
+          error
+        );
+        // Fallback to standard randomness
+        this.dhKeyPair = nacl.box.keyPair();
+      }
+    } else if (!this.dhKeyPair) {
+      // Standard initialization
+      this.dhKeyPair = nacl.box.keyPair();
+    }
+    return this;
+  }
+
+  setDebug(enabled) {
+    this.debug = enabled;
+    return this;
+  }
+
+  log(...args) {
+    if (this.debug) {
+      console.log("(NOBRIDGE) LOG", ...args);
+    }
+  }
+
+  error(...args) {
+    if (this.debug) {
+      console.error("(NOBRIDGE) ERROR", ...args);
+    }
+  }
+
+  deriveKey(key, info, outputLength = 32) {
+    let result = new Uint8Array();
+    let currentInput = new Uint8Array([...key, ...naclUtil.decodeUTF8(info)]);
+    let bytesGenerated = 0;
+
+    while (bytesGenerated < outputLength) {
+      const hash = nacl.hash(currentInput);
+      result = new Uint8Array([...result, ...hash]);
+      bytesGenerated += hash.length;
+
+      const counter = new Uint8Array([(bytesGenerated / 64) & 0xff]);
+      currentInput = new Uint8Array([...hash, ...counter]);
+    }
+
+    return result.slice(0, outputLength);
+  }
+
+  deriveRootKeyAndChainKeys(dhOutput) {
+    const derivedSecret = this.deriveKey(
+      new Uint8Array([...this.rootKey, ...dhOutput]),
+      "ratchet-kdf",
+      96
+    );
+
+    const rootKey = derivedSecret.slice(0, 32);
+    const sendingChainKey = derivedSecret.slice(32, 64);
+    const receivingChainKey = derivedSecret.slice(64, 96);
+
+    if (!sendingChainKey || sendingChainKey.length !== 32) {
+      this.error(
+        "Invalid sendingChainKey derived:",
+        Array.from(sendingChainKey)
+      );
+      throw new Error("Failed to derive valid sendingChainKey");
+    }
+    if (!receivingChainKey || receivingChainKey.length !== 32) {
+      this.error(
+        "Invalid receivingChainKey derived:",
+        Array.from(receivingChainKey)
+      );
+      throw new Error("Failed to derive valid receivingChainKey");
+    }
+
+    return { rootKey, sendingChainKey, receivingChainKey };
+  }
+
+  initializeSession(remotePublicKey) {
+    this.log("Initializing session with remote key:", remotePublicKey);
+    this.log(
+      "Root key on initialization:",
+      naclUtil.encodeBase64(this.rootKey)
+    );
+    this.log(
+      "Chain key on initialization:",
+      naclUtil.encodeBase64(this.chainKey)
+    );
+    this.log("Is initiator:", this.isInitiator);
+    this.log(
+      "Local DH public key:",
+      naclUtil.encodeBase64(this.dhKeyPair.publicKey)
+    );
+    this.log(
+      "Local DH private key:",
+      naclUtil.encodeBase64(this.dhKeyPair.secretKey)
+    );
+
+    this.remotePublicKey = naclUtil.decodeBase64(remotePublicKey);
+
+    if (this.isInitiator) {
+      this.sendingChainKey = this.chainKey;
+      this.receivingChainKey = this.chainKey;
+    } else {
+      this.receivingChainKey = this.chainKey;
+      this.sendingChainKey = this.chainKey;
+    }
+
+    if (!this.sendingChainKey || !this.receivingChainKey) {
+      throw new Error(
+        "Failed to initialize chain keys: keys are null or empty"
+      );
+    }
+
+    this.sendingMessageNumber = 0;
+    this.receivingMessageNumber = 0;
+
+    this.log("Initial chain keys set:", {
+      sendingChainKey: naclUtil.encodeBase64(this.sendingChainKey),
+      receivingChainKey: naclUtil.encodeBase64(this.receivingChainKey),
+    });
+  }
+
+  dhRatchetStep() {
+    this.log("Performing DH ratchet step");
+    this.log(
+      "Current root key before DH ratchet:",
+      naclUtil.encodeBase64(this.rootKey)
+    );
+    const dhOutput = nacl.box.before(
+      this.remotePublicKey,
+      this.dhKeyPair.secretKey
+    );
+    this.log("DH output:", naclUtil.encodeBase64(dhOutput));
+    const derivedKeys = this.deriveRootKeyAndChainKeys(dhOutput);
+    this.rootKey = derivedKeys.rootKey;
+
+    if (this.isInitiator) {
+      this.sendingChainKey = derivedKeys.sendingChainKey;
+      this.receivingChainKey = derivedKeys.receivingChainKey;
+    } else {
+      this.receivingChainKey = derivedKeys.sendingChainKey;
+      this.sendingChainKey = derivedKeys.receivingChainKey;
+    }
+
+    if (!this.sendingChainKey || !this.receivingChainKey) {
+      throw new Error("DH ratchet failed: chain keys are null or empty");
+    }
+
+    this.sendingMessageNumber = 0;
+    this.receivingMessageNumber = 0;
+
+    this.log("DH ratchet completed, new keys:", {
+      rootKey: naclUtil.encodeBase64(this.rootKey),
+      sendingChainKey: naclUtil.encodeBase64(this.sendingChainKey),
+      receivingChainKey: naclUtil.encodeBase64(this.receivingChainKey),
+    });
+  }
+
+  deriveMessageKey(chainKey) {
+    if (!chainKey) {
+      this.error("Chain key is null or undefined during deriveMessageKey");
+      throw new Error("Chain key is null or undefined");
+    }
+
+    const derivedKeys = this.deriveKey(chainKey, "message-kdf", 64);
+    const newChainKey = derivedKeys.slice(0, 32);
+    const messageKey = derivedKeys.slice(32, 64);
+
+    if (!newChainKey || !messageKey) {
+      this.error("Failed to derive message key:", { newChainKey, messageKey });
+      throw new Error("Failed to derive valid message key");
+    }
+
+    return { chainKey: newChainKey, messageKey };
+  }
+
+  // Enhanced encrypt method that uses stronger randomness for nonce when available
+  async encrypt(plaintext) {
+    this.log(`Encrypting message`);
+    this.log(
+      "Root key during encryption:",
+      naclUtil.encodeBase64(this.rootKey)
+    );
+    this.log(
+      "Sending chain key before encryption:",
+      naclUtil.encodeBase64(this.sendingChainKey)
+    );
+    this.log("Sending message number:", this.sendingMessageNumber);
+    this.log("Messages since last DH reset:", this.messagesSinceLastReset);
+
+    // Check if we need to perform a DH ratchet reset after MAX_MESSAGES_BEFORE_DH_RESET messages
+    if (this.messagesSinceLastReset >= this.MAX_MESSAGES_BEFORE_DH_RESET) {
+      this.log(
+        `Resetting DH ratchet after ${this.MAX_MESSAGES_BEFORE_DH_RESET} messages`
+      );
+
+      // Create a new DH key pair with enhanced randomness
+      if (this.useEnhancedRandom) {
+        try {
+          this.dhKeyPair = await enhancedRandom.boxKeyPair();
+          this.log(
+            "New DH Key Pair generated with enhanced randomness for ratchet reset"
+          );
+        } catch (error) {
+          this.error(
+            "Enhanced randomness failed, falling back to standard randomness:",
+            error
+          );
+          // Fallback to standard randomness
+          this.dhKeyPair = nacl.box.keyPair();
+        }
+      } else {
+        // Standard key generation
+        this.dhKeyPair = nacl.box.keyPair();
+      }
+
+      // Perform DH ratchet step
+      this.dhRatchetStep();
+
+      // Reset message counter
+      this.messagesSinceLastReset = 0;
+    }
+
+    if (!this.sendingChainKey) {
+      this.error("sendingChainKey is null before encryption");
+      throw new Error("sendingChainKey is null before encryption");
+    }
+
+    const derived = this.deriveMessageKey(this.sendingChainKey);
+    this.sendingChainKey = derived.chainKey;
+    const messageKey = derived.messageKey;
+
+    this.log("Message encryption key:", naclUtil.encodeBase64(messageKey));
+    this.log(
+      "Sending chain key after derivation:",
+      naclUtil.encodeBase64(this.sendingChainKey)
+    );
+
+    // Use enhanced randomness for the nonce when available
+    let nonce;
+    if (this.useEnhancedRandom) {
+      try {
+        nonce = await enhancedRandom.getRandomBytes(nacl.secretbox.nonceLength);
+      } catch (error) {
+        this.error(
+          "Enhanced randomness failed for nonce, using standard randomness:",
+          error
+        );
+        nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+      }
+    } else {
+      nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+    }
+
+    const ciphertext = nacl.secretbox(
+      naclUtil.decodeUTF8(plaintext),
+      nonce,
+      messageKey
+    );
+
+    if (!ciphertext) {
+      this.error("Encryption failed: Invalid plaintext or key");
+      throw new Error("Encryption failed: Invalid plaintext or key");
+    }
+
+    const header = {
+      dhPubKey: naclUtil.encodeBase64(this.dhKeyPair.publicKey),
+      messageIndex: this.sendingMessageNumber,
+      prevChainLength: 0,
+    };
+
+    this.sendingMessageNumber++;
+    this.messagesSinceLastReset++; // Increment the counter for messages since last DH reset
+
+    return {
+      header: header,
+      ciphertext: naclUtil.encodeBase64(ciphertext),
+      nonce: naclUtil.encodeBase64(nonce),
+    };
+  }
+
+  decrypt(encryptedMessage) {
+    const header = encryptedMessage.header;
+    const ciphertextStr = encryptedMessage.ciphertext;
+    const nonceStr = encryptedMessage.nonce;
+
+    this.log("Decrypting message with header:", header);
+    this.log(
+      "Root key during decryption:",
+      naclUtil.encodeBase64(this.rootKey)
+    );
+    this.log(
+      "Receiving chain key before decryption:",
+      naclUtil.encodeBase64(this.receivingChainKey)
+    );
+    this.log("Receiving message number:", this.receivingMessageNumber);
+
+    if (!header.dhPubKey) {
+      this.error("Missing dhPubKey in message header");
+      throw new Error("Missing dhPubKey in message header");
+    }
+
+    const isValidBase64 = (str) => {
+      try {
+        if (typeof str !== "string") return false;
+        const base64Regex = /^[A-Za-z0-9+/=]+$/;
+        return base64Regex.test(str) && str.length % 4 === 0;
+      } catch {
+        return false;
+      }
+    };
+
+    if (!isValidBase64(ciphertextStr)) {
+      this.error(`Invalid base64 encoding for ciphertext: ${ciphertextStr}`);
+      throw new Error(
+        `Invalid base64 encoding for ciphertext: ${ciphertextStr}`
+      );
+    }
+    if (!isValidBase64(nonceStr)) {
+      this.error(`Invalid base64 encoding for nonce: ${nonceStr}`);
+      throw new Error(`Invalid base64 encoding for nonce: ${nonceStr}`);
+    }
+
+    const ciphertext = naclUtil.decodeBase64(ciphertextStr);
+    const nonce = naclUtil.decodeBase64(nonceStr);
+    const remotePublicKey = naclUtil.decodeBase64(header.dhPubKey);
+
+    const remotePublicKeyStr = naclUtil.encodeBase64(remotePublicKey);
+    const currentRemotePublicKeyStr = this.remotePublicKey
+      ? naclUtil.encodeBase64(this.remotePublicKey)
+      : null;
+
+    this.log("Remote public key from message:", remotePublicKeyStr);
+    this.log("Stored remote public key:", currentRemotePublicKeyStr);
+
+    if (
+      !currentRemotePublicKeyStr ||
+      remotePublicKeyStr !== currentRemotePublicKeyStr
+    ) {
+      this.log("New remote public key detected, performing DH ratchet");
+      this.remotePublicKey = remotePublicKey;
+      this.dhRatchetStep();
+      this.messagesSinceLastReset = 0; // Reset the counter when a DH ratchet occurs
+    } else {
+      this.log("Remote public key unchanged, no DH ratchet needed");
+    }
+
+    const skippedKey = this.skippedMessageKeys.get(
+      `${header.dhPubKey}:${header.messageIndex}`
+    );
+    if (skippedKey) {
+      this.log("Using skipped message key:", naclUtil.encodeBase64(skippedKey));
+      const plaintext = nacl.secretbox.open(ciphertext, nonce, skippedKey);
+      if (plaintext) {
+        this.skippedMessageKeys.delete(
+          `${header.dhPubKey}:${header.messageIndex}`
+        );
+        return naclUtil.encodeUTF8(plaintext);
+      }
+    }
+
+    if (header.messageIndex > this.receivingMessageNumber) {
+      this.log(
+        `Skipping ahead ${
+          header.messageIndex - this.receivingMessageNumber
+        } messages`
+      );
+      this.skipMessageKeys(header.messageIndex - this.receivingMessageNumber);
+    } else if (header.messageIndex < this.receivingMessageNumber) {
+      this.error(
+        `Message index ${header.messageIndex} is less than expected ${this.receivingMessageNumber}`
+      );
+      throw new Error("Message index out of order");
+    }
+
+    if (!this.receivingChainKey) {
+      this.error("receivingChainKey is null before decryption");
+      throw new Error("receivingChainKey is null before decryption");
+    }
+
+    this.log(
+      "Receiving chain key before deriving message key:",
+      naclUtil.encodeBase64(this.receivingChainKey)
+    );
+    const derived = this.deriveMessageKey(this.receivingChainKey);
+    this.receivingChainKey = derived.chainKey;
+    const messageKey = derived.messageKey;
+
+    this.log("Message decryption key:", naclUtil.encodeBase64(messageKey));
+    this.log(
+      "Receiving chain key after derivation:",
+      naclUtil.encodeBase64(this.receivingChainKey)
+    );
+
+    const plaintext = nacl.secretbox.open(ciphertext, nonce, messageKey);
+    if (!plaintext) {
+      this.error("Failed to decrypt message: Invalid ciphertext or key");
+      throw new Error("Decryption failed: Invalid ciphertext or key");
+    }
+
+    this.receivingMessageNumber++;
+    this.messagesSinceLastReset++; // Increment counter for messages since last reset
+
+    const decodedText = naclUtil.encodeUTF8(plaintext);
+    this.log(`Successfully decrypted`);
+    return decodedText;
+  }
+
+  skipMessageKeys(count) {
+    if (count > this.MAX_SKIP) {
+      this.error(`Too many skipped messages (${count} > ${this.MAX_SKIP})`);
+      throw new Error(
+        `Too many skipped messages (${count} > ${this.MAX_SKIP})`
+      );
+    }
+
+    for (let i = 0; i < count; i++) {
+      const derived = this.deriveMessageKey(this.receivingChainKey);
+      this.receivingChainKey = derived.chainKey;
+
+      const key = `${
+        this.remotePublicKey
+          ? naclUtil.encodeBase64(this.remotePublicKey)
+          : "unknown"
+      }:${this.receivingMessageNumber}`;
+      this.skippedMessageKeys.set(key, derived.messageKey);
+      this.receivingMessageNumber++;
+
+      if (this.skippedMessageKeys.size > this.MAX_SKIP) {
+        const oldestKey = Array.from(this.skippedMessageKeys.keys())[0];
+        this.skippedMessageKeys.delete(oldestKey);
+      }
+    }
+    this.log(
+      "Skipped message keys, new receivingMessageNumber:",
+      this.receivingMessageNumber
+    );
+  }
+
+  getPublicKey() {
+    return naclUtil.encodeBase64(this.dhKeyPair.publicKey);
+  }
+
+  getCurrentState() {
+    return {
+      rootKey: naclUtil.encodeBase64(this.rootKey),
+      chainKey: naclUtil.encodeBase64(this.chainKey),
+      sendingChainKey: this.sendingChainKey
+        ? naclUtil.encodeBase64(this.sendingChainKey)
+        : null,
+      receivingChainKey: this.receivingChainKey
+        ? naclUtil.encodeBase64(this.receivingChainKey)
+        : null,
+      sendingMessageNumber: this.sendingMessageNumber,
+      receivingMessageNumber: this.receivingMessageNumber,
+      messagesSinceLastReset: this.messagesSinceLastReset, // Save the messages counter
+      dhKeyPair: {
+        publicKey: naclUtil.encodeBase64(this.dhKeyPair.publicKey),
+        secretKey: naclUtil.encodeBase64(this.dhKeyPair.secretKey),
+      },
+      remotePublicKey: this.remotePublicKey
+        ? naclUtil.encodeBase64(this.remotePublicKey)
+        : null,
+    };
+  }
+
+  loadState(state) {
+    this.rootKey = naclUtil.decodeBase64(state.rootKey);
+    this.chainKey = naclUtil.decodeBase64(state.chainKey);
+    this.sendingChainKey = state.sendingChainKey
+      ? naclUtil.decodeBase64(state.sendingChainKey)
+      : null;
+    this.receivingChainKey = state.receivingChainKey
+      ? naclUtil.decodeBase64(state.receivingChainKey)
+      : null;
+    this.sendingMessageNumber = state.sendingMessageNumber;
+    this.receivingMessageNumber = state.receivingMessageNumber;
+    this.messagesSinceLastReset = state.messagesSinceLastReset || 0; // Load counter with fallback
+    this.dhKeyPair = {
+      publicKey: naclUtil.decodeBase64(state.dhKeyPair.publicKey),
+      secretKey: naclUtil.decodeBase64(state.dhKeyPair.secretKey),
+    };
+    this.remotePublicKey = state.remotePublicKey
+      ? naclUtil.decodeBase64(state.remotePublicKey)
+      : null;
+  }
+}
+
+const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB - increased for better image quality
+
+const ChatScreen = ({ route, navigation }) => {
+  const { width, height } = useWindowDimensions();
+  const isSmallDevice = height < 700; // iPhone SE, small devices
+  const isMediumDevice = height >= 700 && height < 800; // iPhone 13 mini, 12 mini
+  const isLargeDevice = height >= 800; // iPhone 13, 12, 11, etc.
+
+  // Get dynamic keyboard offset based on device size
+  const getKeyboardOffset = () => {
+    if (Platform.OS === "ios") {
+      if (isSmallDevice) return 8;
+      if (isMediumDevice) return 12;
+      return 20; // for larger devices
+    }
+    return 0; // Android
+  };
+
+  // Calculate appropriate padding for input container
+  const getInputPadding = () => {
+    if (Platform.OS === "ios") {
+      if (isSmallDevice) return 8;
+      if (isMediumDevice) return 15;
+      return 20; // for larger devices
+    }
+    return 15; // Android
+  };
+
+  // Calculate appropriate margin bottom for input container
+  const getInputMargin = () => {
+    if (Platform.OS === "ios") {
+      if (isSmallDevice) return 5;
+      if (isMediumDevice) return 10;
+      return 15; // for larger devices
+    }
+    return 5; // Android
+  };
+
+  const {
+    contact,
+    userId: initialUserId,
+    username: initialUsername,
+  } = route.params || {};
+  const contactData = {
+    name: contact?.name || contact?.username || "Unknown",
+    status: contact?.status || "offline",
+  };
+
+  const [messages, setMessages] = useState([]);
+  const [newMessage, setNewMessage] = useState("");
+  const [isContactValid, setIsContactValid] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [currentUsername, setCurrentUsername] = useState(null);
+  const [ratchet, setRatchet] = useState(null);
+  const [isImageModalVisible, setIsImageModalVisible] = useState(false);
+  const [selectedImageUrl, setSelectedImageUrl] = useState(null);
+  const flatListRef = useRef();
+  const socketRef = useRef(null);
+  const [isImageOptionsVisible, setIsImageOptionsVisible] = useState(false);
+  const [deleteModalVisible, setDeleteModalVisible] = useState(false);
+  const [selectedMessage, setSelectedMessage] = useState(null);
+  const [messageStatuses, setMessageStatuses] = useState({}); // Track message statuses
+
+  // Use a ref to track if message destruction setup has already been done
+  const destructionSetupRef = useRef(false);
+
+  useEffect(() => {
+    const initializeUser = async () => {
+      let userId = initialUserId;
+      let username = initialUsername;
+
+      if (!userId || !username) {
+        userId = await SecureStore.getItemAsync("userId");
+        username = await SecureStore.getItemAsync("username");
+      }
+
+      if (!userId || !username) {
+        Alert.alert(
+          "Error",
+          "User ID or username missing. Please log in again.",
+          [
+            {
+              text: "OK",
+              onPress: () =>
+                navigation.reset({ index: 0, routes: [{ name: "Login" }] }),
+            },
+          ]
+        );
+        return;
+      }
+
+      setCurrentUserId(userId);
+      setCurrentUsername(username);
+
+      // Store both user IDs for message status updates
+      if (contactData && contactData._id) {
+        await SecureStore.setItemAsync("contactId", contactData._id);
+        await SecureStore.setItemAsync("currentReceiverId", contactData._id);
+        console.log(
+          "Stored contact ID for message status updates:",
+          contactData._id
+        );
+      }
+
+      console.log("(NOBRIDGE) LOG Navigating to ChatScreen with:", {
+        contactUsername: contactData.name,
+        contactId: contactData._id,
+        userId,
+        username,
+      });
+    };
+
+    initializeUser();
+  }, [initialUserId, initialUsername, navigation]);
+
+  useEffect(() => {
+    const initializeRatchet = async () => {
+      if (!currentUserId || !currentUsername) return;
+
+      try {
+        const ratchetStateStr = await SecureStore.getItemAsync(
+          `ratchetState_${contactData.name}`
+        );
+        if (!ratchetStateStr) {
+          throw new Error("Ratchet state not found for this contact.");
+        }
+
+        const ratchetState = JSON.parse(ratchetStateStr);
+        console.log("(NOBRIDGE) LOG Loaded ratchet state:", ratchetState);
+
+        const sharedSecret = naclUtil.decodeBase64(ratchetState.rootKey);
+        const chainKey = naclUtil.decodeBase64(ratchetState.chainKey);
+        const isInitiator = currentUsername < contactData.name;
+
+        const dhKeyPair = {
+          publicKey: naclUtil.decodeBase64(ratchetState.dhKeyPair.publicKey),
+          secretKey: naclUtil.decodeBase64(ratchetState.dhKeyPair.privateKey),
+        };
+
+        const ratchetInstance = new DoubleRatchet(
+          sharedSecret,
+          chainKey,
+          isInitiator,
+          dhKeyPair
+        ).setDebug(true);
+
+        const updatedRatchetStateStr = await SecureStore.getItemAsync(
+          `ratchetState_${contactData.name}_updated`
+        );
+        if (updatedRatchetStateStr) {
+          const updatedRatchetState = JSON.parse(updatedRatchetStateStr);
+          ratchetInstance.loadState(updatedRatchetState);
+          console.log(
+            "(NOBRIDGE) LOG Loaded updated ratchet state:",
+            updatedRatchetState
+          );
+        } else {
+          ratchetInstance.initializeSession(ratchetState.theirDhPubKey);
+        }
+
+        setRatchet(ratchetInstance);
+      } catch (error) {
+        console.error(
+          "(NOBRIDGE) ERROR Failed to initialize ratchet:",
+          String(error)
+        );
+        Alert.alert(
+          "Error",
+          "Failed to initialize encryption. Please re-establish contact."
+        );
+        navigation.goBack();
+      }
+    };
+
+    initializeRatchet();
+  }, [currentUserId, currentUsername, contactData.name, navigation]);
+
+  useEffect(() => {
+    return () => {
+      // Cleanup on unmount
+    };
+  }, []);
+
+  const saveImageToFileSystem = async (base64Data, messageId) => {
+    try {
+      const fileUri = `${FileSystem.documentDirectory}chat_images/${messageId}.jpg`;
+      await FileSystem.makeDirectoryAsync(
+        `${FileSystem.documentDirectory}chat_images`,
+        { intermediates: true }
+      );
+      await FileSystem.writeAsStringAsync(fileUri, base64Data, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      return fileUri;
+    } catch (error) {
+      console.error(
+        "(NOBRIDGE) ERROR Failed to save image to filesystem:",
+        String(error)
+      );
+      return null;
+    }
+  };
+
+  const loadLocalMessages = async () => {
+    try {
+      const storedMessages = await SecureStore.getItemAsync(
+        `messages_${currentUsername}_${contactData.name}`
+      );
+
+      // Also load message statuses
+      const storedStatuses = await SecureStore.getItemAsync(
+        `statuses_${currentUsername}_${contactData.name}`
+      );
+
+      if (storedStatuses) {
+        try {
+          const parsedStatuses = JSON.parse(storedStatuses);
+          console.log(
+            "(NOBRIDGE) LOG Loading stored message statuses from SecureStore"
+          );
+          setMessageStatuses(parsedStatuses);
+        } catch (error) {
+          console.error(
+            "(NOBRIDGE) ERROR Failed to parse message statuses:",
+            error
+          );
+        }
+      }
+
+      if (storedMessages) {
+        console.log("(NOBRIDGE) LOG Loading stored messages from SecureStore");
+
+        let parsedMessages;
+        try {
+          parsedMessages = JSON.parse(storedMessages);
+
+          // Validate the parsed messages array
+          if (!Array.isArray(parsedMessages)) {
+            console.error(
+              "(NOBRIDGE) ERROR Invalid messages format in storage - not an array"
+            );
+            await SecureStore.deleteItemAsync(
+              `messages_${currentUsername}_${contactData.name}`
+            );
+            return [];
+          }
+
+          // Log message count and sample
+          if (parsedMessages && parsedMessages.length > 0) {
+            console.log(
+              `(NOBRIDGE) LOG Found ${parsedMessages.length} stored messages. Sample:`,
+              parsedMessages.slice(0, 2)
+            );
+
+            // Update message statuses from stored messages if they have status data
+            const newStatuses = {};
+            parsedMessages.forEach((msg) => {
+              if (msg.id && msg.status && msg.isMe) {
+                newStatuses[msg.id] = msg.status;
+              }
+            });
+
+            if (Object.keys(newStatuses).length > 0) {
+              setMessageStatuses((prevStatuses) => ({
+                ...prevStatuses,
+                ...newStatuses,
+              }));
+            }
+          } else {
+            console.log(
+              "(NOBRIDGE) LOG No stored messages found or invalid format"
+            );
+          }
+        } catch (parseError) {
+          console.error(
+            "(NOBRIDGE) ERROR Failed to parse messages from storage:",
+            parseError
+          );
+          await SecureStore.deleteItemAsync(
+            `messages_${currentUsername}_${contactData.name}`
+          );
+          return [];
+        }
+
+        // Strictly validate messages to prevent corrupted/partial messages from appearing
+        const validMessages = await Promise.all(
+          parsedMessages
+            .filter((msg) => {
+              // More lenient validation - this prevents the [invalid message] display
+              if (!msg.id || typeof msg.isMe === "undefined") {
+                console.error(
+                  "(NOBRIDGE) ERROR Invalid message in storage (missing id or isMe):",
+                  msg
+                );
+                return false;
+              }
+
+              // Fix messages with undefined text
+              if (msg.text === undefined) {
+                console.log(
+                  `(NOBRIDGE) LOG Fixing message ${msg.id} with undefined text`
+                );
+                msg.text = msg.isMe ? "Message" : "[No content]";
+              }
+
+              // A message is valid if it has either text or an image path
+              const hasContent = msg.text !== undefined || msg.imagePath;
+              if (!hasContent) {
+                console.log(
+                  "(NOBRIDGE) LOG Skipping message with no content:",
+                  msg.id
+                );
+              }
+              return hasContent;
+            })
+            .map(async (msg) => {
+              let imageData = null;
+              if (msg.imagePath) {
+                try {
+                  const fileInfo = await FileSystem.getInfoAsync(msg.imagePath);
+                  if (fileInfo.exists) {
+                    const base64 = await FileSystem.readAsStringAsync(
+                      msg.imagePath,
+                      { encoding: FileSystem.EncodingType.Base64 }
+                    );
+                    imageData = `data:image/jpeg;base64,${base64}`;
+                  }
+                } catch (error) {
+                  console.error(
+                    "(NOBRIDGE) ERROR Failed to load image for message:",
+                    msg.id,
+                    String(error)
+                  );
+                }
+              }
+
+              // Preserve the original timestamp to ensure destruction works properly
+              // If timestamp is missing, use the current time as fallback
+              const timestamp = msg.timestamp || Date.now();
+
+              // Check timestamp validity - if it's far in the future, reset it
+              const isFutureTimestamp = timestamp > Date.now() + 60000; // 1 minute buffer
+              const finalTimestamp = isFutureTimestamp ? Date.now() : timestamp;
+
+              if (isFutureTimestamp) {
+                console.log(
+                  `(NOBRIDGE) LOG Fixing future timestamp for message ${msg.id}: ${timestamp} -> ${finalTimestamp}`
+                );
+              }
+
+              return {
+                id: msg.id,
+                text: msg.text || null,
+                imageData: imageData || null,
+                imagePath: msg.imagePath || null,
+                time: msg.time || "00:00",
+                isMe: msg.isMe,
+                timestamp: finalTimestamp,
+                seen: msg.seen || false,
+                seenAt: msg.seenAt || null,
+                status: messageStatuses[msg.id] || (msg.isMe ? "sent" : null), // Save status with message
+              };
+            })
+        );
+
+        // Log the results of validation
+        console.log(
+          `(NOBRIDGE) LOG After validation: ${validMessages.length} valid messages`
+        );
+
+        if (validMessages.length !== parsedMessages.length) {
+          // If we filtered out any messages, update the storage to prevent reappearance
+          console.log(
+            `(NOBRIDGE) LOG Fixed ${
+              parsedMessages.length - validMessages.length
+            } invalid messages in storage`
+          );
+          await saveLocalMessages(validMessages);
+        }
+
+        // Perform an initial message destruction check right after loading messages
+        if (validMessages.length > 0) {
+          // We'll check if any messages need immediate destruction based on their timestamps
+          await checkForExpiredMessages(validMessages);
+        }
+
+        return validMessages;
+      }
+      return [];
+    } catch (error) {
+      console.error(
+        "(NOBRIDGE) ERROR Failed to load local messages:",
+        String(error)
+      );
+      return [];
+    }
+  };
+
+  const saveLocalMessages = async (msgs) => {
+    try {
+      const validMessages = msgs
+        .filter((msg) => {
+          if (!msg.id || typeof msg.isMe === "undefined") {
+            // Only log errors for invalid messages in development
+            /*
+            console.error(
+              "(NOBRIDGE) ERROR Attempting to save invalid message (missing id or isMe):",
+              msg
+            );
+            */
+            return false;
+          }
+
+          // Safety check: Normalize message fields to prevent undefined values
+          if (msg.text === undefined) {
+            // Add a fallback text value if undefined - no need to log this
+            // console.log(
+            //   "(NOBRIDGE) LOG Fixing message with undefined text:",
+            //   msg.id
+            // );
+            msg.text = msg.isMe ? "Message sent" : "[Message content missing]";
+          }
+
+          // A message should have either text or image data/path after normalization
+          if (!msg.text && !msg.imageData && !msg.imagePath) {
+            /*
+            console.error(
+              "(NOBRIDGE) ERROR Attempting to save empty message:",
+              msg
+            );
+            */
+            return false;
+          }
+          return true;
+        })
+        .map((msg) => ({
+          id: msg.id,
+          text: msg.text || null,
+          imagePath: msg.imagePath || null,
+          time: msg.time || "00:00",
+          isMe: msg.isMe,
+          timestamp: msg.timestamp || Date.now(),
+          seen: msg.seen || false,
+          seenAt: msg.seenAt || null,
+          status: messageStatuses[msg.id] || (msg.isMe ? "sent" : null), // Save status with message
+        }));
+
+      if (validMessages.length > 0) {
+        await SecureStore.setItemAsync(
+          `messages_${currentUsername}_${contactData.name}`,
+          JSON.stringify(validMessages)
+        );
+
+        // Also save message statuses separately for better retrieval
+        await SecureStore.setItemAsync(
+          `statuses_${currentUsername}_${contactData.name}`,
+          JSON.stringify(messageStatuses)
+        );
+      }
+    } catch (error) {
+      console.error(
+        "(NOBRIDGE) ERROR Failed to save local messages:",
+        String(error)
+      );
+    }
+  };
+
+  const saveRatchetState = async () => {
+    if (ratchet) {
+      try {
+        const updatedState = ratchet.getCurrentState();
+        await SecureStore.setItemAsync(
+          `ratchetState_${contactData.name}_updated`,
+          JSON.stringify(updatedState)
+        );
+        console.log(
+          "(NOBRIDGE) LOG Saved updated ratchet state:",
+          updatedState
+        );
+      } catch (error) {
+        console.error(
+          "(NOBRIDGE) ERROR Failed to save ratchet state:",
+          String(error)
+        );
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!currentUserId || !ratchet) return;
+
+    const initializeSocket = async () => {
+      const authToken = await SecureStore.getItemAsync("token");
+      if (!authToken) {
+        Alert.alert("Error", "Authentication token missing", [
+          {
+            text: "OK",
+            onPress: () =>
+              navigation.reset({ index: 0, routes: [{ name: "Login" }] }),
+          },
+        ]);
+        return;
+      }
+
+      socketRef.current = io(CONFIG.BACKEND_URL, {
+        auth: { token: authToken },
+        reconnection: true,
+        reconnectionAttempts: 10,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 5000,
+      });
+
+      socketRef.current.on("connect", () => {
+        console.log("(NOBRIDGE) LOG Socket.IO connected");
+        socketRef.current.emit("register", currentUserId.toString());
+      });
+
+      socketRef.current.on("newMessage", async (message) => {
+        console.log("(NOBRIDGE) LOG Received newMessage event:", message);
+        if (
+          !message ||
+          typeof message !== "object" ||
+          !message._id ||
+          !message.sender ||
+          !message.sender._id ||
+          !message.sender.username ||
+          !message.receiver ||
+          !message.receiver.username ||
+          !message.headers ||
+          !message.ciphertext ||
+          !message.nonce ||
+          !message.sentAt
+        ) {
+          console.error(
+            "(NOBRIDGE) ERROR Invalid message received via socket:",
+            message
+          );
+          return;
+        }
+
+        if (
+          message.sender.username === contactData.name ||
+          message.receiver.username === contactData.name
+        ) {
+          const isMySentMessage =
+            message.sender._id.toString() === currentUserId.toString();
+
+          // Skip processing messages from ourselves through socket - we already handle them locally
+          if (isMySentMessage) {
+            console.log(
+              "(NOBRIDGE) LOG Skipping processing of our own sent message:",
+              message._id
+            );
+            return;
+          }
+
+          try {
+            // Process message from other user (we're the receiver)
+            console.log(
+              "(NOBRIDGE) LOG Processing received message:",
+              message._id
+            );
+
+            let decryptedData;
+            try {
+              decryptedData = ratchet.decrypt({
+                header: message.headers,
+                ciphertext: message.ciphertext,
+                nonce: message.nonce,
+              });
+            } catch (decryptError) {
+              console.error(
+                "(NOBRIDGE) ERROR Failed to decrypt message:",
+                message._id,
+                String(decryptError)
+              );
+              // Even if we can't decrypt, mark the message as processed
+              try {
+                const authToken = await SecureStore.getItemAsync("token");
+                if (authToken) {
+                  await axios.delete(
+                    `${CONFIG.BACKEND_URL}/api/messages/${message._id}`,
+                    {
+                      headers: { Authorization: `Bearer ${authToken}` },
+                    }
+                  );
+                  console.log(
+                    "(NOBRIDGE) LOG Deleted unreadable message from server:",
+                    message._id
+                  );
+                }
+              } catch (deleteError) {
+                console.error(
+                  "(NOBRIDGE) ERROR Failed to delete unreadable message from server:",
+                  String(deleteError)
+                );
+              }
+              return; // Skip further processing
+            }
+
+            let imageData = null;
+            let imagePath = null;
+
+            if (message.type === "image") {
+              imageData = decryptedData;
+              imagePath = await saveImageToFileSystem(
+                imageData.split(",")[1],
+                message._id
+              );
+            }
+
+            const newMessage = {
+              id: message._id.toString(),
+              text: message.type === "text" ? decryptedData : null,
+              imageData,
+              imagePath,
+              time: new Date(message.sentAt).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+              }),
+              isMe: false, // It's a received message (we confirmed it's not our own)
+              timestamp: new Date(message.sentAt).getTime(),
+            };
+
+            // Check if we already have this message to prevent duplicates
+            setMessages((prev) => {
+              const isDuplicate = prev.some((msg) => msg.id === newMessage.id);
+
+              if (!newMessage.id || isDuplicate) {
+                console.log(
+                  "(NOBRIDGE) LOG Skipping duplicate or invalid message:",
+                  newMessage.id
+                );
+                return prev;
+              }
+
+              console.log(
+                "(NOBRIDGE) LOG Adding received message:",
+                newMessage.id
+              );
+              const updatedMessages = [...prev, newMessage];
+              saveLocalMessages(updatedMessages);
+              return updatedMessages;
+            });
+
+            await saveRatchetState();
+
+            // Only delete received messages from server after processing them
+            try {
+              await axios.delete(
+                `${CONFIG.BACKEND_URL}/api/messages/${message._id}`,
+                {
+                  headers: { Authorization: `Bearer ${authToken}` },
+                }
+              );
+              console.log(
+                "(NOBRIDGE) LOG Deleted received message from server:",
+                message._id
+              );
+            } catch (deleteError) {
+              console.error(
+                "(NOBRIDGE) ERROR Failed to delete message from server:",
+                String(deleteError)
+              );
+            }
+
+            setTimeout(() => {
+              flatListRef.current?.scrollToEnd({ animated: true });
+            }, 100);
+          } catch (error) {
+            console.error(
+              "(NOBRIDGE) ERROR Failed to decrypt new message:",
+              String(error)
+            );
+          }
+        }
+      });
+
+      socketRef.current.on("connect_error", (error) => {
+        console.error(
+          "(NOBRIDGE) ERROR Socket connection error:",
+          String(error)
+        );
+      });
+
+      // Listen for message status updates
+      socketRef.current.on("message_status_update", (data) => {
+        console.log("(NOBRIDGE) LOG Received message status update:", data);
+        if (data && data.messageId && data.status) {
+          // Update UI with the new status
+          setMessageStatuses((prev) => ({
+            ...prev,
+            [data.messageId]: data.status,
+          }));
+
+          // If this is "seen" status, we can also trigger deletion of the message status record
+          // from the server after a delay to ensure everyone has received it
+          if (data.status === "seen" && contactData._id) {
+            // This will help clean up the server after the "seen" status has been received by both parties
+            setTimeout(async () => {
+              try {
+                const authToken = await SecureStore.getItemAsync("token");
+                if (authToken) {
+                  await axios.delete(
+                    `${CONFIG.BACKEND_URL}/api/message-status/${data.messageId}`,
+                    { headers: { Authorization: `Bearer ${authToken}` } }
+                  );
+                  console.log(
+                    `Deleted message status for ${data.messageId} after seen confirmation`
+                  );
+                }
+              } catch (error) {
+                // It's okay if this fails - the server has a cleanup mechanism too
+                console.log(
+                  `Could not delete message status: ${error.message}`
+                );
+              }
+            }, 10000); // 10 seconds delay
+          }
+        }
+      });
+
+      socketRef.current.on("disconnect", (reason) => {
+        console.log("(NOBRIDGE) LOG Socket disconnected:", reason);
+        if (reason === "io server disconnect") {
+          socketRef.current.connect();
+        }
+      });
+
+      // Listen for message status updates
+      socketRef.current.on("message_status_update", (data) => {
+        console.log("(NOBRIDGE) LOG Received message status update:", data);
+        if (data && data.messageId && data.status) {
+          setMessageStatuses((prev) => ({
+            ...prev,
+            [data.messageId]: data.status,
+          }));
+        }
+      });
+
+      return () => {
+        if (socketRef.current) {
+          socketRef.current.disconnect();
+          socketRef.current = null;
+        }
+      };
+    };
+
+    initializeSocket();
+
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+        socketRef.current = null;
+      }
+    };
+  }, [currentUserId, contactData.name, ratchet, navigation]);
+
+  const checkContactStatus = async () => {
+    if (!currentUserId || !currentUsername) {
+      console.error(
+        "(NOBRIDGE) LOG ChatScreen - checkContactStatus: Missing currentUserId or currentUsername"
+      );
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const authToken = await SecureStore.getItemAsync("token");
+      if (!authToken) throw new Error("Authentication token missing");
+
+      const storedContacts = await SecureStore.getItemAsync(
+        `${currentUsername}_contacts`
+      );
+      const contactsList = storedContacts ? JSON.parse(storedContacts) : [];
+      console.log(
+        "(NOBRIDGE) LOG Checking chat access - Stored contacts:",
+        contactsList
+      );
+      console.log("(NOBRIDGE) LOG Attempting to chat with:", contactData.name);
+      if (!contactsList.includes(contactData.name)) {
+        throw new Error("Not a contact");
+      }
+
+      const invitesResponse = await axios.get(
+        `${CONFIG.BACKEND_URL}/api/invites/received`,
+        {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }
+      );
+
+      const removedInvite = invitesResponse.data.find(
+        (invite) =>
+          (invite.sender?.username === contactData.name ||
+            invite.receiver?.username === contactData.name) &&
+          invite.status === "removed"
+      );
+      if (removedInvite) throw new Error("Contact has been removed");
+
+      setIsContactValid(true);
+
+      // First load local messages
+      let decryptedMessages = await loadLocalMessages();
+
+      // We'll only fetch from server if we're receiving messages, not for our sent messages
+      // This avoids duplicates and unnecessary processing
+      console.log(
+        "(NOBRIDGE) LOG Server now only returns messages where we are the RECEIVER"
+      );
+
+      const messagesResponse = await axios.get(
+        `${CONFIG.BACKEND_URL}/api/messages`,
+        {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }
+      );
+
+      // Track which message IDs we already have locally to avoid duplicates
+      const existingMessageIds = new Set(
+        decryptedMessages.map((msg) => msg.id)
+      );
+
+      // Only process messages where we are the RECEIVER (not the sender)
+      const filteredMessages = messagesResponse.data.filter(
+        (msg) =>
+          msg.sender &&
+          msg.receiver &&
+          msg.sender.username &&
+          msg.receiver.username &&
+          msg._id &&
+          !existingMessageIds.has(msg._id.toString()) && // Skip messages we already have locally
+          msg.sender.username === contactData.name && // ONLY messages where contact is sender
+          msg.receiver.username === currentUsername // and we are receiver
+      );
+
+      console.log(
+        "(NOBRIDGE) LOG Fetched messages where we are RECEIVER from server:",
+        filteredMessages.length
+      );
+
+      // Collect message IDs to mark as delivered
+      const messageIdsToMarkDelivered = [];
+
+      // Skip processing if there are no new messages
+      if (filteredMessages.length === 0) {
+        console.log("(NOBRIDGE) LOG No new messages to process from server");
+
+        // Even with no new messages, mark existing ones as delivered
+        if (decryptedMessages.length > 0) {
+          const undeliveredMessages = decryptedMessages.filter(
+            (msg) =>
+              !msg.isMe &&
+              !msg.seen &&
+              (!messageStatuses[msg.id] || messageStatuses[msg.id] === "sent")
+          );
+
+          if (undeliveredMessages.length > 0) {
+            console.log(
+              `Marking ${undeliveredMessages.length} existing messages as delivered`
+            );
+
+            for (const msg of undeliveredMessages) {
+              messageIdsToMarkDelivered.push(msg.id);
+
+              // Update status in UI immediately
+              setMessageStatuses((prev) => ({
+                ...prev,
+                [msg.id]: "delivered",
+              }));
+            }
+          }
+        }
+
+        setMessages(decryptedMessages);
+
+        if (decryptedMessages.length > 0) {
+          setTimeout(() => {
+            flatListRef.current?.scrollToEnd({ animated: false });
+          }, 100);
+        }
+
+        // Send batch delivery confirmations if needed
+        if (messageIdsToMarkDelivered.length > 0) {
+          try {
+            await messageStatusHandler.markMessagesAsDelivered(
+              messageIdsToMarkDelivered
+            );
+            console.log(
+              `Updated delivery status for ${messageIdsToMarkDelivered.length} messages`
+            );
+          } catch (markError) {
+            console.error("Failed to mark messages as delivered:", markError);
+          }
+        }
+
+        setIsLoading(false);
+        return;
+      }
+
+      for (const msg of filteredMessages) {
+        try {
+          // Process message from contact (we're the receiver) - decrypt normally
+          const decryptedData = ratchet.decrypt({
+            header: msg.headers,
+            ciphertext: msg.ciphertext,
+            nonce: msg.nonce,
+          });
+
+          let imageData = null;
+          let imagePath = null;
+
+          if (msg.type === "image") {
+            imageData = decryptedData;
+            imagePath = await saveImageToFileSystem(
+              imageData.split(",")[1],
+              msg._id
+            );
+          }
+
+          const newMessage = {
+            id: msg._id.toString(),
+            text: msg.type === "text" ? decryptedData : null,
+            imageData,
+            imagePath,
+            time: new Date(msg.sentAt).toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+            isMe: false,
+            timestamp: new Date(msg.sentAt).getTime(),
+          };
+
+          if (!decryptedMessages.some((m) => m.id === newMessage.id)) {
+            // Add message to our local collection
+            decryptedMessages.push(newMessage);
+
+            // Add to list of messages to mark as delivered
+            messageIdsToMarkDelivered.push(newMessage.id);
+
+            // Mark as delivered since we've successfully received it
+            setMessageStatuses((prev) => ({
+              ...prev,
+              [newMessage.id]: "delivered",
+            }));
+          }
+
+          // Delete the received message from server after processing
+          try {
+            await axios.delete(
+              `${CONFIG.BACKEND_URL}/api/messages/${msg._id}`,
+              {
+                headers: { Authorization: `Bearer ${authToken}` },
+              }
+            );
+            console.log(
+              "(NOBRIDGE) LOG Deleted received message from server:",
+              msg._id
+            );
+          } catch (error) {
+            console.error(
+              "(NOBRIDGE) ERROR Failed to delete message from server:",
+              String(error)
+            );
+          }
+        } catch (error) {
+          console.error(
+            "(NOBRIDGE) ERROR Failed to decrypt message during fetch:",
+            String(error)
+          );
+        }
+      }
+
+      // Send batch delivery confirmations
+      if (messageIdsToMarkDelivered.length > 0) {
+        try {
+          await messageStatusHandler.markMessagesAsDelivered(
+            messageIdsToMarkDelivered
+          );
+          console.log(
+            `Updated delivery status for ${messageIdsToMarkDelivered.length} messages`
+          );
+        } catch (markError) {
+          console.error("Failed to mark messages as delivered:", markError);
+        }
+      }
+
+      await saveLocalMessages(decryptedMessages);
+      setMessages(decryptedMessages);
+
+      await saveRatchetState();
+
+      if (decryptedMessages.length > 0) {
+        setTimeout(() => {
+          flatListRef.current?.scrollToEnd({ animated: false });
+        }, 100);
+      }
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error
+          ? error.message
+          : String(error) || "Unknown error occurred";
+      console.error(
+        "(NOBRIDGE) ERROR ChatScreen - checkContactStatus error:",
+        errorMessage
+      );
+
+      if (error.response?.status === 401) {
+        Alert.alert("Error", "Session expired. Please log in again.", [
+          {
+            text: "OK",
+            onPress: async () => {
+              await SecureStore.deleteItemAsync("token");
+              navigation.reset({ index: 0, routes: [{ name: "Login" }] });
+            },
+          },
+        ]);
+      } else {
+        Alert.alert(
+          "Error",
+          errorMessage === "Not a contact"
+            ? "You can only chat with accepted contacts."
+            : errorMessage === "Contact has been removed"
+            ? "This contact is no longer available."
+            : `Failed to load chat: ${errorMessage}`
+        );
+        navigation.goBack();
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (currentUserId && currentUsername && ratchet) {
+      checkContactStatus();
+    }
+  }, [currentUserId, currentUsername, ratchet, contactData.name]);
+
+  const handleImageOption = async (option) => {
+    try {
+      setIsImageOptionsVisible(false);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      let result;
+      if (option === "library") {
+        const { status } =
+          await ImagePicker.requestMediaLibraryPermissionsAsync();
+        if (status !== "granted") {
+          Alert.alert(
+            "Permission required",
+            "Need permission to access your photos"
+          );
+          return;
+        }
+
+        result = await ImagePicker.launchImageLibraryAsync({
+          mediaTypes: ["images"],
+          quality: 0.8,
+          allowsEditing: true,
+          aspect: [4, 3],
+        });
+      } else if (option === "camera") {
+        const { status } = await ImagePicker.requestCameraPermissionsAsync();
+        if (status !== "granted") {
+          Alert.alert(
+            "Permission required",
+            "Need permission to access your camera"
+          );
+          return;
+        }
+
+        result = await ImagePicker.launchCameraAsync({
+          mediaTypes: ["images"],
+          quality: 0.8,
+          allowsEditing: true,
+          aspect: [4, 3],
+        });
+      }
+
+      if (!result.canceled && result.assets && result.assets.length > 0) {
+        const asset = result.assets[0];
+        processAndSendImage(asset.uri);
+      }
+    } catch (error) {
+      console.error("(NOBRIDGE) ERROR Image picker:", error);
+      Alert.alert("Error", "Could not access photos/camera");
+    }
+  };
+
+  const processAndSendImage = async (uri) => {
+    try {
+      if (!uri) return;
+
+      const manipResult = await ImageManipulator.manipulateAsync(
+        uri,
+        [{ resize: { width: 700 } }],
+        {
+          compress: 0.2,
+          format: ImageManipulator.SaveFormat.JPEG,
+          base64: true,
+        }
+      );
+
+      if (manipResult.base64) {
+        const imageSize = manipResult.base64.length * 0.75;
+        if (imageSize > MAX_FILE_SIZE) {
+          const compressedResult = await ImageManipulator.manipulateAsync(
+            uri,
+            [{ resize: { width: 800 } }],
+            {
+              compress: 0.2,
+              format: ImageManipulator.SaveFormat.JPEG,
+              base64: true,
+            }
+          );
+
+          if (compressedResult.base64.length * 0.75 > MAX_FILE_SIZE) {
+            Alert.alert(
+              "Error",
+              "Image is too large. Please use a smaller image."
+            );
+            return;
+          }
+
+          await sendImage(compressedResult.base64);
+        } else {
+          await sendImage(manipResult.base64);
+        }
+      }
+    } catch (error) {
+      console.error("(NOBRIDGE) ERROR Processing image:", error);
+      Alert.alert("Error", "Failed to process image");
+    }
+  };
+
+  const sendImage = async (base64Data) => {
+    if (!isContactValid || !ratchet) return;
+
+    try {
+      const authToken = await SecureStore.getItemAsync("token");
+      if (!authToken) throw new Error("Authentication token missing");
+
+      const imageData = `data:image/jpeg;base64,${base64Data}`;
+      const tempId = uuidv4();
+      const imagePath = await saveImageToFileSystem(base64Data, tempId);
+
+      const newMsg = {
+        id: tempId,
+        text: null,
+        imageData,
+        imagePath,
+        time: new Date().toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+        isMe: true,
+      };
+
+      setMessages((prev) => {
+        const updatedMessages = [...prev, newMsg];
+        saveLocalMessages(updatedMessages);
+        return updatedMessages;
+      });
+
+      const encryptedMessage = await ratchet.encrypt(imageData);
+      const expiresAt = new Date(
+        Date.now() + 5 * 60 * 60 * 1000 // 5 hours instead of 7 days
+      ).toISOString();
+
+      const response = await axios.post(
+        `${CONFIG.BACKEND_URL}/api/messages/send`,
+        {
+          receiver: contactData.name,
+          ciphertext: encryptedMessage.ciphertext,
+          nonce: encryptedMessage.nonce,
+          headers: {
+            dhPubKey: encryptedMessage.header.dhPubKey,
+            messageIndex: encryptedMessage.header.messageIndex,
+            prevChainLength: encryptedMessage.header.prevChainLength,
+          },
+          type: "image",
+          expiresAt,
+        },
+        {
+          headers: { Authorization: `Bearer ${authToken}` },
+          timeout: 30000,
+        }
+      );
+
+      const finalImagePath = await saveImageToFileSystem(
+        base64Data,
+        response.data._id
+      );
+
+      setMessages((prev) => {
+        const updatedMessages = prev.map((msg) =>
+          msg.id === tempId
+            ? {
+                id: response.data._id.toString(),
+                text: null,
+                imageData,
+                imagePath: finalImagePath,
+                time: new Date(response.data.sentAt).toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                }),
+                isMe: true,
+              }
+            : msg
+        );
+        saveLocalMessages(updatedMessages);
+        return updatedMessages;
+      });
+
+      if (imagePath !== finalImagePath) {
+        await FileSystem.deleteAsync(imagePath, { idempotent: true });
+      }
+
+      await saveRatchetState();
+
+      setTimeout(() => {
+        flatListRef.current?.scrollToEnd({ animated: true });
+      }, 100);
+    } catch (error) {
+      console.error("(NOBRIDGE) ERROR Sending image:", error);
+      Alert.alert("Error", "Failed to send image");
+    }
+  };
+
+  const handleDeleteMessage = async (messageId) => {
+    try {
+      if (!messageId) return;
+      console.log("(NOBRIDGE) LOG Deleting message:", messageId);
+
+      // Get the current messages from SecureStore
+      const messagesKey = `messages_${currentUsername}_${contactData.name}`;
+      const storedMessagesJson = await SecureStore.getItemAsync(messagesKey);
+
+      if (storedMessagesJson) {
+        const storedMessages = JSON.parse(storedMessagesJson);
+
+        // Filter out the message to delete
+        const updatedMessages = storedMessages.filter(
+          (msg) => msg.id !== messageId
+        );
+
+        // Save updated messages back to SecureStore
+        await SecureStore.setItemAsync(
+          messagesKey,
+          JSON.stringify(updatedMessages)
+        );
+        console.log(
+          `(NOBRIDGE) LOG Removed message ${messageId} from SecureStore`
+        );
+
+        // Update state to remove the message from UI
+        setMessages((prevMessages) =>
+          prevMessages.filter((msg) => msg.id !== messageId)
+        );
+      }
+
+      // Also try to delete from server if it exists there
+      try {
+        const authToken = await SecureStore.getItemAsync("token");
+        if (authToken) {
+          await axios.delete(
+            `${CONFIG.BACKEND_URL}/api/messages/${messageId}`,
+            {
+              headers: { Authorization: `Bearer ${authToken}` },
+            }
+          );
+          console.log(
+            `(NOBRIDGE) LOG Deleted message ${messageId} from server`
+          );
+        }
+      } catch (serverError) {
+        console.log(
+          `(NOBRIDGE) LOG Message ${messageId} not found on server or already deleted`
+        );
+        // Continue even if server deletion fails - might not be on server
+      }
+
+      // Close the modal
+      setSelectedMessage(null);
+      setDeleteModalVisible(false);
+    } catch (error) {
+      console.error("(NOBRIDGE) ERROR Failed to delete message:", error);
+      Alert.alert("Error", "Failed to delete message");
+    }
+  };
+
+  const renderMessage = ({ item }) => {
+    // Check if the message is valid
+    const isValidMessage = item && item.id && (item.text || item.imageData);
+
+    if (!isValidMessage) {
+      console.log(
+        "(NOBRIDGE) LOG Skipping invalid message in render:",
+        item?.id || "unknown"
+      );
+      return null;
+    }
+
+    return (
+      <TouchableOpacity
+        activeOpacity={0.8}
+        onLongPress={() => {
+          setSelectedMessage(item);
+          setDeleteModalVisible(true);
+        }}
+      >
+        <View
+          style={[
+            styles.messageContainer,
+            item.isMe ? styles.myMessage : styles.theirMessage,
+          ]}
+        >
+          <View
+            style={[
+              styles.messageBubble,
+              item.isMe ? styles.myBubble : styles.theirBubble,
+              // Apply status-specific styles for my messages
+              item.isMe &&
+                messageStatuses[item.id] === "sent" &&
+                styles.myBubbleSent,
+              item.isMe &&
+                messageStatuses[item.id] === "delivered" &&
+                styles.myBubbleDelivered,
+              item.isMe &&
+                messageStatuses[item.id] === "seen" &&
+                styles.myBubbleSeen,
+              item.isMe &&
+                messageStatuses[item.id] === "expired" &&
+                styles.myBubbleExpired,
+            ]}
+            onLayout={() => {
+              const markAsSeen = async () => {
+                try {
+                  // Get destruction setting from SecureStore
+                  const destructionSetting = await SecureStore.getItemAsync(
+                    "messageDestructionOption"
+                  );
+
+                  // Skip marking as seen if destruction is disabled (null or "never")
+                  if (
+                    destructionSetting === null ||
+                    destructionSetting === "never"
+                  ) {
+                    return; // Early return - no need to mark as seen
+                  }
+
+                  // Only mark the message as seen if it's not already seen and
+                  // not our own message and destruction is enabled
+                  if (!item.seen && !item.isMe) {
+                    /*
+                    console.log(
+                      `(NOBRIDGE) LOG Marking message ${item.id} as seen for destruction in ${destructionSetting}`
+                    );
+                    */
+
+                    const now = Date.now();
+
+                    // Mark message as seen without modifying the timestamp
+                    setMessages((prevMessages) =>
+                      prevMessages.map((msg) =>
+                        msg.id === item.id
+                          ? { ...msg, seen: true, seenAt: now }
+                          : msg
+                      )
+                    );
+
+                    // Also save to storage to persist the seen status without modifying timestamp
+                    const updatedMessages = messages.map((msg) =>
+                      msg.id === item.id
+                        ? {
+                            ...msg,
+                            seen: true,
+                            seenAt: now,
+                            // Ensure we preserve the original time and timestamp
+                            time: msg.time,
+                            timestamp: msg.timestamp,
+                          }
+                        : msg
+                    );
+
+                    saveLocalMessages(updatedMessages);
+
+                    // Update message status to "seen" in state
+                    setMessageStatuses((prev) => ({
+                      ...prev,
+                      [item.id]: "seen",
+                    }));
+
+                    // Add a delay before reporting "seen" status to allow sender to see status
+                    // This gives time for the message to be marked as seen before potential deletion
+                    setTimeout(async () => {
+                      try {
+                        await messageStatusHandler.updateMessageStatus(
+                          item.id,
+                          "seen",
+                          socketRef
+                        );
+                      } catch (statusError) {
+                        console.error(
+                          "Failed to update message status to seen:",
+                          statusError
+                        );
+                      }
+                    }, 500); // 500ms delay
+
+                    // Add a longer delay before actual message destruction
+                    // This ensures the status change propagates to sender
+                    if (destructionSetting && destructionSetting !== "never") {
+                      const destructionDelay = 60000; // 1 minute delay to give time for status sync
+                      setTimeout(() => {
+                        checkMessageDestruction();
+                      }, destructionDelay);
+                    }
+                  }
+                } catch (error) {
+                  console.error(
+                    "(NOBRIDGE) ERROR Failed to mark message as seen:",
+                    error
+                  );
+                }
+              };
+              markAsSeen();
+            }}
+          >
+            {item.text ? (
+              <Text style={styles.messageText}>{item.text}</Text>
+            ) : item.imageData ? (
+              <TouchableOpacity
+                onPress={() => {
+                  setSelectedImageUrl(item.imageData);
+                  setIsImageModalVisible(true);
+                }}
+              >
+                <Image
+                  source={{ uri: item.imageData }}
+                  style={styles.messageImage}
+                  resizeMode="contain"
+                />
+              </TouchableOpacity>
+            ) : (
+              <Text style={styles.invalidMessageText}>[Message deleted]</Text>
+            )}
+            <View style={styles.messageFooter}>
+              <Text style={styles.messageTime}>{item.time || "00:00"}</Text>
+              {item.isMe && (
+                <View style={styles.statusIcon}>
+                  {messageStatuses[item.id] === "expired" ? (
+                    <Ionicons
+                      name="timer-outline"
+                      size={14}
+                      color={CONFIG.MESSAGE_STATUS_COLORS.expired}
+                    />
+                  ) : messageStatuses[item.id] === "seen" ? (
+                    <View style={{ flexDirection: "row" }}>
+                      <Ionicons
+                        name="checkmark"
+                        size={14}
+                        color={CONFIG.MESSAGE_STATUS_COLORS.seen}
+                      />
+                      <Ionicons
+                        name="checkmark"
+                        size={14}
+                        color={CONFIG.MESSAGE_STATUS_COLORS.seen}
+                        style={{ marginLeft: -5 }}
+                      />
+                    </View>
+                  ) : messageStatuses[item.id] === "delivered" ? (
+                    <View style={{ flexDirection: "row" }}>
+                      <Ionicons
+                        name="checkmark"
+                        size={14}
+                        color={CONFIG.MESSAGE_STATUS_COLORS.delivered}
+                      />
+                      <Ionicons
+                        name="checkmark"
+                        size={14}
+                        color={CONFIG.MESSAGE_STATUS_COLORS.delivered}
+                        style={{ marginLeft: -5 }}
+                      />
+                    </View>
+                  ) : (
+                    // Default to sent
+                    <Ionicons
+                      name="checkmark"
+                      size={14}
+                      color={CONFIG.MESSAGE_STATUS_COLORS.sent}
+                    />
+                  )}
+                </View>
+              )}
+            </View>
+          </View>
+        </View>
+      </TouchableOpacity>
+    );
+  };
+
+  const renderInputContainer = () => (
+    <View
+      style={{
+        ...styles.inputContainer,
+        paddingBottom: getInputPadding(),
+        marginBottom: getInputMargin(),
+      }}
+    >
+      <TouchableOpacity
+        style={styles.attachmentButton}
+        onPress={() => setIsImageOptionsVisible(true)}
+      >
+        <Ionicons name="images-outline" size={24} color="white" />
+      </TouchableOpacity>
+
+      <TextInput
+        style={styles.input}
+        value={newMessage}
+        onChangeText={setNewMessage}
+        placeholder="Type a message..."
+        placeholderTextColor="#888"
+        multiline
+      />
+
+      <TouchableOpacity
+        style={[
+          styles.sendButton,
+          newMessage.trim()
+            ? styles.sendButtonActive
+            : styles.sendButtonInactive,
+        ]}
+        onPress={handleSendMessage}
+        disabled={!newMessage.trim()}
+      >
+        <Ionicons
+          name="send"
+          size={24}
+          color={!newMessage.trim() ? "#666" : "white"}
+        />
+      </TouchableOpacity>
+
+      <Modal
+        isVisible={isImageOptionsVisible}
+        onBackdropPress={() => setIsImageOptionsVisible(false)}
+        style={styles.imageOptionsModal}
+        backdropTransitionOutTiming={0}
+        animationOutTiming={200}
+      >
+        <View style={styles.imageOptionsContainer}>
+          <TouchableOpacity
+            style={styles.imageOption}
+            onPress={() => handleImageOption("library")}
+          >
+            <Ionicons name="images-outline" size={30} color="white" />
+            <Text style={styles.imageOptionText}>Choose from Library</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.imageOption}
+            onPress={() => handleImageOption("camera")}
+          >
+            <Ionicons name="camera-outline" size={30} color="white" />
+            <Text style={styles.imageOptionText}>Take Photo</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.imageOption, styles.cancelOption]}
+            onPress={() => setIsImageOptionsVisible(false)}
+          >
+            <Ionicons name="close-circle-outline" size={30} color="#ff6666" />
+            <Text style={[styles.imageOptionText, { color: "#ff6666" }]}>
+              Cancel
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </Modal>
+    </View>
+  );
+
+  const handleSendMessage = async () => {
+    if (!newMessage.trim() || !isContactValid || !ratchet) return;
+
+    try {
+      const authToken = await SecureStore.getItemAsync("token");
+      if (!authToken) throw new Error("Authentication token missing");
+
+      // Store the original message text before sending
+      const originalText = newMessage.trim();
+
+      const encryptedMessage = await ratchet.encrypt(originalText);
+      const tempId = uuidv4();
+      const now = new Date();
+      const expiresAt = new Date(
+        Date.now() + 5 * 60 * 60 * 1000 // 5 hours instead of 7 days
+      ).toISOString();
+
+      // Create the new message object with the original text
+      const newMsg = {
+        id: tempId,
+        text: originalText, // Use the original text
+        imageData: null,
+        imagePath: null,
+        time: now.toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+        isMe: true,
+        timestamp: now.getTime(),
+      };
+
+      // Remove log statement that logs message details
+      /*
+      console.log("(NOBRIDGE) LOG Adding sent message:", {
+        id: newMsg.id,
+        text: newMsg.text,
+        isMe: newMsg.isMe,
+      });
+      */
+
+      setMessages((prev) => {
+        const updatedMessages = [...prev, newMsg];
+        saveLocalMessages(updatedMessages);
+        return updatedMessages;
+      });
+      setNewMessage("");
+
+      const response = await axios.post(
+        `${CONFIG.BACKEND_URL}/api/messages/send`,
+        {
+          receiver: contactData.name,
+          ciphertext: encryptedMessage.ciphertext,
+          nonce: encryptedMessage.nonce,
+          headers: {
+            dhPubKey: encryptedMessage.header.dhPubKey,
+            messageIndex: encryptedMessage.header.messageIndex,
+            prevChainLength: encryptedMessage.header.prevChainLength,
+          },
+          type: "text",
+          expiresAt,
+        },
+        { headers: { Authorization: `Bearer ${authToken}` } }
+      );
+
+      // Set initial message status to "sent"
+      setMessageStatuses((prev) => {
+        const updatedStatuses = {
+          ...prev,
+          [response.data._id.toString()]: "sent",
+        };
+        
+        // Save message statuses to local storage
+        SecureStore.setItemAsync(
+          `statuses_${currentUsername}_${contactData.name}`,
+          JSON.stringify(updatedStatuses)
+        );
+        
+        return updatedStatuses;
+      });
+
+      // Update the message with the server ID but keep the original text
+      setMessages((prev) => {
+        const updatedMessages = prev.map((msg) =>
+          msg.id === tempId
+            ? {
+                id: response.data._id.toString(),
+                text: originalText, // Keep the original text
+                imageData: null,
+                imagePath: null,
+                time: new Date(response.data.sentAt).toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                }),
+                isMe: true,
+                timestamp: new Date(response.data.sentAt).getTime(),
+              }
+            : msg
+        );
+
+        // Remove log statement that logs updated message details
+        /*
+        console.log("(NOBRIDGE) LOG Updated sent message with server ID:", {
+          originalId: tempId,
+          newId: response.data._id.toString(),
+          text: originalText,
+        });
+        */
+
+        saveLocalMessages(updatedMessages);
+        return updatedMessages;
+      });
+
+      await saveRatchetState();
+
+      setTimeout(() => {
+        flatListRef.current?.scrollToEnd({ animated: true });
+      }, 100);
+    } catch (error) {
+      console.error(
+        "(NOBRIDGE) ERROR ChatScreen - Error sending message:",
+        String(error)
+      );
+      Alert.alert("Error", `Failed to send message: ${String(error)}`);
+    }
+  };
+
+  // Create a completely rewritten version of the useEffect with the message destruction logic
+  useEffect(() => {
+    const checkMessageDestruction = async () => {
+      // Prevent multiple setup attempts
+      if (destructionSetupRef.current) {
+        return;
+      }
+
+      try {
+        const destructionSetting = await SecureStore.getItemAsync(
+          "messageDestructionOption"
+        );
+
+        // If destructionSetting is null or "never", disable message destruction
+        if (destructionSetting === "never" || destructionSetting === null) {
+          console.log("(NOBRIDGE) LOG Message destruction disabled");
+          return; // Early return without setting up any timers
+        }
+
+        // Mark setup as completed
+        destructionSetupRef.current = true;
+
+        console.log(
+          `(NOBRIDGE) LOG Message destruction enabled: ${destructionSetting}`
+        );
+
+        // Set destruction delay based on setting
+        let destructionDelay = 60000; // 1 minute default
+        let checkInterval = 60000; // Check every minute by default
+
+        switch (destructionSetting) {
+          case "15s":
+            destructionDelay = 60 * 1000; // Increased from 15s to 60s to allow status updates
+            checkInterval = 10000; // Check every 10 seconds
+            break;
+          case "1m":
+            destructionDelay = 5 * 60 * 1000; // Increased from 1 minute to 5 minutes
+            break;
+          case "1h":
+            destructionDelay = 60 * 60 * 1000; // 1 hour
+            break;
+          case "1d":
+            destructionDelay = 24 * 60 * 60 * 1000; // 1 day
+            break;
+          case "1w":
+            destructionDelay = 7 * 24 * 60 * 60 * 1000; // 1 week
+            break;
+          default:
+            destructionDelay = 5 * 60 * 1000; // fallback to 5 minutes
+        }
+
+        // Keep track of already deleted message IDs to avoid processing them multiple times
+        const deletedMessageIds = new Set();
+
+        const deleteExpiredMessages = async () => {
+          // Skip if there are no messages to check
+          if (!messages || messages.length === 0) {
+            return;
+          }
+
+          try {
+            const now = Date.now();
+            // Handle potential clock issues by using the max sent timestamp as reference
+            let maxMessageTime = 0;
+            messages.forEach((msg) => {
+              if (msg.timestamp && !isNaN(parseInt(msg.timestamp))) {
+                maxMessageTime = Math.max(maxMessageTime, parseInt(msg.timestamp));
+              }
+            });
+
+            // If current time is significantly earlier than max message time,
+            // we have a device clock issue. Adjust reference time.
+            const referenceTime =
+              now < maxMessageTime - 60000 ? maxMessageTime : now;
+
+            // Find expired messages
+            const messagesToDeleteFromDevice = [];
+            const messagesToDeleteFromServer = [];
+            const remainingMessages = [];
+
+            for (const msg of messages) {
+              // Skip messages we've already processed
+              if (deletedMessageIds.has(msg.id)) {
+                continue;
+              }
+
+              // Check if the message has a valid timestamp
+              let timestamp = msg.timestamp ? parseInt(msg.timestamp) : 0;
+              if (isNaN(timestamp) || timestamp <= 0) {
+                // If timestamp is invalid, use a fallback or current time
+                timestamp = now - destructionDelay / 2; // Make it halfway to expiration
+                console.warn(
+                  `(NOBRIDGE) WARNING: Invalid timestamp for message ${msg.id}, using fallback time`
+                );
+              }
+
+              // Check if the message has expired
+              const messageAge = referenceTime - timestamp;
+              
+              // Add special handling for "seen" status messages - give them more time 
+              // to ensure the status update is propagated to the sender
+              let adjustedDestructionDelay = destructionDelay;
+              if (msg.isMe && messageStatuses[msg.id] === "seen") {
+                // For seen messages sent by me, double the expiration time to ensure status propagation
+                adjustedDestructionDelay = destructionDelay * 2;
+              }
+              
+              const hasExpired = messageAge > adjustedDestructionDelay;
+
+              if (hasExpired) {
+                // Add to appropriate deletion lists
+                if (msg.status === "received") {
+                  // Server delete for received messages
+                  messagesToDeleteFromServer.push(msg);
+                }
+
+                // Mark message as expired first
+                setMessageStatuses((prev) => ({
+                  ...prev,
+                  [msg.id]: "expired",
+                }));
+
+                // Try to update status via API
+                try {
+                  await messageStatusHandler.updateMessageStatus(
+                    msg.id,
+                    "expired",
+                    socketRef
+                  );
+                } catch (statusError) {
+                  console.error(
+            // Try to update status via API (this might fail if the message is already deleted on server)
+            try {
+              await messageStatusHandler.updateMessageStatus(
+                msg.id,
+                "expired",
+                socketRef
+              );
+            } catch (statusError) {
+              console.error(
+                "Failed to update message status to expired:",
+                statusError
+              );
+            }
+
+            // Device delete for all expired messages (both sent and received)
+            messagesToDeleteFromDevice.push(msg.id);
+            deletedMessageIds.add(msg.id);
+          } else {
+            // Keep the message if not expired
+            remainingMessages.push(msg);
+          }
+        }
+
+        // If there are any messages to delete from the device
+        const deviceDeleteIds = messagesToDeleteFromDevice;
+        if (deviceDeleteIds.length > 0) {
+          console.log(
+            `(NOBRIDGE) LOG Deleting ${deviceDeleteIds.length} expired messages from local device`
+          );
+
+          // Update state
+          setMessages(remainingMessages);
+
+          // Update SecureStore - CRITICAL SECTION that needs fixing
+          try {
+            // Get the storage key for messages
+            const storedMessagesKey = `messages_${currentUsername}_${contactData.name}`;
+
+            // DIRECT APPROACH: Get remaining messages from state and save them
+            // This is more reliable than trying to filter the stored messages
+            await SecureStore.setItemAsync(
+              storedMessagesKey,
+              JSON.stringify(remainingMessages)
+            );
+
+            console.log(
+              `(NOBRIDGE) LOG Directly saved ${remainingMessages.length} remaining messages to storage, removing ${deviceDeleteIds.length} messages`
+            );
+
+            // Verify storage update
+            const verifyMessagesJson = await SecureStore.getItemAsync(
+              storedMessagesKey
+            );
+
+            if (verifyMessagesJson) {
+              try {
+                const verifyMessages = JSON.parse(verifyMessagesJson);
+                console.log(
+                  `(NOBRIDGE) LOG Storage verification: ${verifyMessages.length} messages remain in storage`
+                );
+
+                // Additional verification - check if any deleted messages still exist
+                const remainingDeletedIds = deviceDeleteIds.filter((id) =>
+                  verifyMessages.some((msg) => msg.id === id)
+                );
+
+                if (remainingDeletedIds.length > 0) {
+                  console.error(
+                    `(NOBRIDGE) ERROR ${
+                      remainingDeletedIds.length
+                    } messages failed to delete from storage: ${remainingDeletedIds.join(
+                      ", "
+                    )}`
+                  );
+
+                  // Emergency fix - force direct removal by ID
+                  const finalCleanMessages = verifyMessages.filter(
+                    (msg) => !deviceDeleteIds.includes(msg.id)
+                  );
+
+                  await SecureStore.setItemAsync(
+                    storedMessagesKey,
+                    JSON.stringify(finalCleanMessages)
+                  );
+
+                  // Second verification for critical security feature
+                  try {
+                    const secondVerifyJson = await SecureStore.getItemAsync(
+                      storedMessagesKey
+                    );
+                    if (secondVerifyJson) {
+                      const secondVerifyMessages = JSON.parse(secondVerifyJson);
+                      const stillPresentIds = deviceDeleteIds.filter((id) =>
+                        secondVerifyMessages.some((msg) => msg.id === id)
+                      );
+
+                      if (stillPresentIds.length > 0) {
+                        console.error(
+                          `(NOBRIDGE) ERROR CRITICAL: ${stillPresentIds.length} messages STILL present after multiple deletion attempts`
+                        );
+                        // Last resort - recreate storage completely
+                        await SecureStore.deleteItemAsync(storedMessagesKey);
+                        await SecureStore.setItemAsync(
+                          storedMessagesKey,
+                          JSON.stringify(remainingMessages)
+                        );
+                      } else {
+                        console.log(
+                          `(NOBRIDGE) LOG Emergency cleanup successful`
+                        );
+                      }
+                    }
+                  } catch (secondVerifyError) {
+                    console.error(
+                      "(NOBRIDGE) ERROR Failed to verify secondary cleanup:",
+                      secondVerifyError
+                    );
+                  }
+                }
+              } catch (parseError) {
+                console.error(
+                  "(NOBRIDGE) ERROR Failed to parse stored messages during verification:",
+                  parseError
+                );
+              }
+            } catch (error) {
+              console.error(
+                "(NOBRIDGE) ERROR Failed to delete messages from device storage:",
+                error
+              );
+            }
+        } else {
+          console.log("(NOBRIDGE) LOG No messages to delete at this time");
+        }
+
+        // If we have any RECEIVED messages to delete from the server
+        if (messagesToDeleteFromServer.length > 0) {
+          try {
+            const authToken = await SecureStore.getItemAsync("token");
+            if (authToken) {
+              // Filter out invalid IDs
+              const serverDeleteIds = messagesToDeleteFromServer
+                .map((msg) => msg.id)
+                .filter((id) => id && typeof id === "string");
+
+              if (serverDeleteIds.length > 0) {
+                console.log(
+                  `(NOBRIDGE) LOG Deleting ${serverDeleteIds.length} received messages from server`
+                );
+
+                await axios.post(
+                  `${CONFIG.BACKEND_URL}/api/messages/delete-multiple`,
+                  { messageIds: serverDeleteIds },
+                  { headers: { Authorization: `Bearer ${authToken}` } }
+                );
+              }
+            }
+          } catch (error) {
+            console.error(
+              "(NOBRIDGE) ERROR Failed to delete messages from server:",
+              error
+            );
+          }
+        }
+      };
+
+      // Set up an interval to check for expired messages regularly
+      const destructionInterval = setInterval(
+        deleteExpiredMessages,
+        checkInterval
+      );
+
+      // Run an initial check immediately
+      try {
+        deleteExpiredMessages();
+      } catch (error) {
+        console.error("Error during initial message deletion:", error);
+      }
+
+      // Return cleanup function to clear the interval when component unmounts
+      return () => {
+        clearInterval(destructionInterval);
+        destructionSetupRef.current = false;
+      };
+    };
+
+    // Run the message destruction setup logic with a small delay
+    const setupTimer = setTimeout(() => {
+      checkMessageDestruction();
+    }, 1000); // Small delay to ensure state is settled
+
+    // Clean up timer on unmount
+    return () => {
+      clearTimeout(setupTimer);
+      destructionSetupRef.current = false;
+    };
+  }, [messages, currentUsername, contactData]);
+
+  // Initialize enhanced randomness when component mounts
+  useEffect(() => {
+    const initRandom = async () => {
+      try {
+        await enhancedRandom.initialize();
+        console.log("Enhanced randomness initialized in ChatScreen");
+      } catch (error) {
+        console.error("Error initializing enhanced randomness:", error);
+      }
+    };
+
+    initRandom();
+  }, []);
+
+  // Component cleanup on unmount
+  useEffect(() => {
+    return () => {
+      // Reset message destruction setup ref on unmount
+      destructionSetupRef.current = false;
+
+      // Clear any potential lingering timers or intervals
+      // This helps prevent "Can't perform a React state update on an unmounted component" warnings
+      const cleanup = () => {
+        console.log("(NOBRIDGE) LOG Cleaning up ChatScreen resources");
+      };
+
+      cleanup();
+    };
+  }, []);
+
+  // Fix the checkForExpiredMessages function to also ensure complete deletion
+  const checkForExpiredMessages = async (loadedMessages) => {
+    try {
+      // If no destruction setting or set to never, skip checking
+      const destructionSetting = await SecureStore.getItemAsync(
+        "messageDestructionOption"
+      );
+      if (destructionSetting === null || destructionSetting === "never") {
+        return loadedMessages;
+      }
+
+      console.log(
+        `(NOBRIDGE) LOG Checking for expired messages upon loading (${destructionSetting})`
+      );
+
+      // Set destruction delay based on setting
+      let destructionDelay = 60000; // 1 minute default
+      switch (destructionSetting) {
+        case "15s":
+          destructionDelay = 15 * 1000; // 15 seconds
+          break;
+        case "1m":
+          destructionDelay = 60 * 1000; // 1 minute
+          break;
+        case "1h":
+          destructionDelay = 60 * 60 * 1000; // 1 hour
+          break;
+        case "1d":
+          destructionDelay = 24 * 60 * 60 * 1000; // 1 day
+          break;
+        case "1w":
+          destructionDelay = 7 * 24 * 60 * 60 * 1000; // 1 week
+          break;
+      }
+
+      const now = Date.now();
+      const messagesToDelete = [];
+      const messagesToKeep = [];
+
+      // Handle potential clock issues by finding max message timestamp
+      let maxMessageTime = 0;
+      loadedMessages.forEach((msg) => {
+        if (msg.timestamp && !isNaN(parseInt(msg.timestamp))) {
+          maxMessageTime = Math.max(maxMessageTime, parseInt(msg.timestamp));
+        }
+      });
+
+      // If current time is significantly earlier than max message time,
+      // we likely have a device clock issue. Use adjusted reference time.
+      const referenceTime = now < maxMessageTime - 60000 ? maxMessageTime : now;
+
+      // Check for expired messages
+      for (const msg of loadedMessages) {
+        // Make sure timestamp is a valid number
+        let timestamp = msg.timestamp ? parseInt(msg.timestamp) : 0;
+        if (isNaN(timestamp) || timestamp <= 0) {
+          // If the timestamp is invalid, use current time as fallback
+          // This effectively keeps the message for one more destruction cycle
+          timestamp = now;
+          console.warn(
+            `(NOBRIDGE) WARNING Invalid timestamp for message ${msg.id}, using current time`
+          );
+        }
+
+        // Check message age against destruction delay
+        const messageAge = referenceTime - timestamp;
+        const hasExpired = messageAge > destructionDelay;
+
+        if (hasExpired) {
+          console.log(
+            `(NOBRIDGE) LOG Message ${msg.id} has expired (age: ${messageAge}ms)`
+          );
+          messagesToDelete.push(msg.id);
+
+          // If this is a received message, also queue for server deletion
+          if (msg.status === "received") {
+            try {
+              const authToken = await SecureStore.getItemAsync("token");
+              if (authToken) {
+                console.log(
+                  `(NOBRIDGE) LOG Deleting expired message ${msg.id} from server`
+                );
+                await axios.post(
+                  `${CONFIG.BACKEND_URL}/api/messages/delete-multiple`,
+                  { messageIds: [msg.id] },
+                  { headers: { Authorization: `Bearer ${authToken}` } }
+                );
+              }
+            } catch (serverError) {
+              console.error(
+                "(NOBRIDGE) ERROR Failed to delete message from server:",
+                serverError
+              );
+              // Continue with local deletion even if server deletion fails
+            }
+          }
+        } else {
+          messagesToKeep.push(msg);
+        }
+      }
+
+      // If we found messages to delete, update storage
+      if (messagesToDelete.length > 0) {
+        console.log(
+          `(NOBRIDGE) LOG Found ${messagesToDelete.length} messages to delete immediately on load`
+        );
+
+        // Update local storage directly with ONLY the messages to keep
+        const messagesKey = `messages_${currentUsername}_${contactData.name}`;
+
+        // Clear and update storage with only kept messages
+        await SecureStore.setItemAsync(
+          messagesKey,
+          JSON.stringify(messagesToKeep)
+        );
+
+        // Verify the changes took effect
+        try {
+          const verifyJson = await SecureStore.getItemAsync(messagesKey);
+          if (verifyJson) {
+            const verifyMessages = JSON.parse(verifyJson);
+            // Check if any deleted messages still exist in storage
+            const stillPresent = messagesToDelete.filter((id) =>
+              verifyMessages.some((msg) => msg.id === id)
+            );
+
+            if (stillPresent.length > 0) {
+              console.error(
+                `(NOBRIDGE) ERROR ${stillPresent.length} messages still present after deletion attempt`
+              );
+              // Emergency direct approach - completely rebuild storage content without the deleted messages
+              const emergencyFilteredMessages = verifyMessages.filter(
+                (msg) => !messagesToDelete.includes(msg.id)
+              );
+              await SecureStore.setItemAsync(
+                messagesKey,
+                JSON.stringify(emergencyFilteredMessages)
+              );
+
+              // Second verification pass for critical security feature
+              const secondVerifyJson = await SecureStore.getItemAsync(
+                messagesKey
+              );
+              if (secondVerifyJson) {
+                try {
+                  const secondVerifyMessages = JSON.parse(secondVerifyJson);
+                  const stillPresentAfterEmergency = messagesToDelete.filter(
+                    (id) => secondVerifyMessages.some((msg) => msg.id === id)
+                  );
+
+                  if (stillPresentAfterEmergency.length > 0) {
+                    console.error(
+                      `(NOBRIDGE) ERROR CRITICAL: ${stillPresentAfterEmergency.length} messages STILL present after emergency delete`
+                    );
+                    // Last resort - completely recreate the storage
+                    await SecureStore.deleteItemAsync(messagesKey);
+                    await SecureStore.setItemAsync(
+                      messagesKey,
+                      JSON.stringify(messagesToKeep)
+                    );
+                  }
+                } catch (error) {
+                  console.error(
+                    "(NOBRIDGE) ERROR Failed to parse verification after emergency cleanup:",
+                    error
+                  );
+                }
+              }
+            } else {
+              console.log(
+                `(NOBRIDGE) LOG Storage cleanup verified: all ${messagesToDelete.length} messages removed`
+              );
+            }
+          }
+        } catch (verifyError) {
+          console.error(
+            "(NOBRIDGE) ERROR Failed to verify message deletion:",
+            verifyError
+          );
+        }
+
+        // Return the filtered messages for in-memory use
+        return messagesToKeep;
+      }
+
+      // No messages to delete, return original array
+      return loadedMessages;
+    } catch (error) {
+      console.error(
+        "(NOBRIDGE) ERROR Error checking for expired messages:",
+        error
+      );
+      return loadedMessages;
+    }
+  };
+
+  if (isLoading || !currentUserId || !ratchet) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="#252762" />
+        <View style={styles.header}>
+          <TouchableOpacity onPress={() => navigation.goBack()}>
+            <Ionicons name="arrow-back-outline" size={24} color="white" />
+          </TouchableOpacity>
+          <View style={styles.headerCenter}>
+            <Image
+              source={require("../../assets/profile.png")}
+              style={styles.headerProfileImage}
+            />
+            <Text style={styles.headerText}>{String(contactData.name)}</Text>
+          </View>
+          <View style={styles.width24} />
+        </View>
+        <View style={styles.loadingContainer}>
+          <Text style={styles.loadingText}>Loading chat...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (!isContactValid) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="#252762" />
+        <View style={styles.header}>
+          <TouchableOpacity onPress={() => navigation.goBack()}>
+            <Ionicons name="arrow-back-outline" size={24} color="white" />
+          </TouchableOpacity>
+          <View style={styles.headerCenter}>
+            <Image
+              source={require("../../assets/profile.png")}
+              style={styles.headerProfileImage}
+            />
+            <Text style={styles.headerText}>{String(contactData.name)}</Text>
+          </View>
+          <View style={styles.width24} />
+        </View>
+        <View style={styles.errorContainer}>
+          <Text style={styles.errorText}>You cannot chat with this user.</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor="#252762" />
+      <View style={styles.header}>
+        <TouchableOpacity onPress={() => navigation.goBack()}>
+          <Ionicons name="arrow-back-outline" size={24} color="white" />
+        </TouchableOpacity>
+        <View style={styles.headerCenter}>
+          <Image
+            source={require("../../assets/profile.png")}
+            style={styles.headerProfileImage}
+          />
+          <Text style={styles.headerText}>{String(contactData.name)}</Text>
+        </View>
+        <View style={styles.width24} />
+      </View>
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={styles.flex}
+        keyboardVerticalOffset={getKeyboardOffset()}
+      >
+        <FlatList
+          ref={flatListRef}
+          data={messages}
+          renderItem={renderMessage}
+          keyExtractor={(item, index) =>
+            item && item.id ? `msg-${item.id}-${index}` : `fallback-${index}`
+          }
+          contentContainerStyle={styles.messagesList}
+          onContentSizeChange={() =>
+            flatListRef.current?.scrollToEnd({ animated: true })
+          }
+        />
+        {renderInputContainer()}
+      </KeyboardAvoidingView>
+
+      <Modal
+        isVisible={isImageModalVisible}
+        onBackdropPress={() => setIsImageModalVisible(false)}
+        style={styles.modal}
+      >
+        <View style={styles.modalContent}>
+          {selectedImageUrl && (
+            <ImageViewer
+              imageUrls={[{ url: selectedImageUrl }]}
+              enableSwipeDown={true}
+              onSwipeDown={() => setIsImageModalVisible(false)}
+              renderIndicator={() => null}
+            />
+          )}
+          <TouchableOpacity
+            style={styles.modalCloseButton}
+            onPress={() => setIsImageModalVisible(false)}
+          >
+            <Ionicons name="close" size={30} color="white" />
+          </TouchableOpacity>
+        </View>
+      </Modal>
+
+      <Modal
+        isVisible={deleteModalVisible}
+        onBackdropPress={() => setDeleteModalVisible(false)}
+        style={styles.deleteModalContainer}
+        backdropTransitionOutTiming={0}
+        animationOutTiming={200}
+      >
+        <View style={styles.deleteModalContent}>
+          <Text style={styles.deleteModalTitle}>Message Options</Text>
+
+          <TouchableOpacity
+            style={styles.deleteOption}
+            onPress={() => handleDeleteMessage(selectedMessage?.id)}
+          >
+            <Ionicons name="trash-outline" size={22} color="#FF3B30" />
+            <Text style={styles.deleteOptionText}>Delete Message</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.cancelOption}
+            onPress={() => setDeleteModalVisible(false)}
+          >
+            <Text style={styles.cancelOptionText}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: "#252762",
+  },
+  flex: {
+    flex: 1,
+  },
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: 15,
+    backgroundColor: "#252762",
+    borderBottomWidth: 1,
+    borderBottomColor: "#fff",
+    position: "relative",
+  },
+  headerCenter: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  headerProfileImage: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    marginRight: 10,
+    borderWidth: 2,
+    borderColor: "#ffffff33",
+  },
+  headerText: {
+    color: "white",
+    fontSize: 18,
+    fontWeight: "600",
+    textShadowColor: "rgba(255, 255, 255, 0.3)",
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 10,
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  loadingText: {
+    color: "#888",
+    fontSize: 16,
+  },
+  errorContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  errorText: {
+    color: "#FF3B30",
+    fontSize: 16,
+  },
+  messagesList: {
+    padding: 10,
+  },
+  messageContainer: {
+    flexDirection: "row",
+    marginBottom: 10,
+    alignItems: "flex-end",
+  },
+  myMessage: {
+    justifyContent: "flex-end",
+  },
+  theirMessage: {
+    justifyContent: "flex-start",
+  },
+  messageBubble: {
+    maxWidth: "70%",
+    padding: 12,
+    borderRadius: 15,
+  },
+  myBubble: {
+    backgroundColor: "#4A80F0", // Default blue (sent)
+    borderBottomRightRadius: 5,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+  myBubbleSent: {
+    backgroundColor: CONFIG.MESSAGE_STATUS_COLORS.sent,
+    shadowColor: CONFIG.MESSAGE_STATUS_COLORS.sent,
+  },
+  myBubbleDelivered: {
+    backgroundColor: CONFIG.MESSAGE_STATUS_COLORS.delivered,
+    shadowColor: CONFIG.MESSAGE_STATUS_COLORS.delivered,
+  },
+  myBubbleSeen: {
+    backgroundColor: CONFIG.MESSAGE_STATUS_COLORS.seen,
+    shadowColor: CONFIG.MESSAGE_STATUS_COLORS.seen,
+  },
+  myBubbleExpired: {
+    backgroundColor: CONFIG.MESSAGE_STATUS_COLORS.expired,
+    shadowColor: CONFIG.MESSAGE_STATUS_COLORS.expired,
+  },
+  theirBubble: {
+    backgroundColor: "rgba(255, 255, 255, 0.1)",
+    borderBottomLeftRadius: 5,
+  },
+  imageBubble: {
+    padding: 5,
+  },
+  messageText: {
+    color: "white",
+    fontSize: 16,
+  },
+  messageImage: {
+    width: 200,
+    height: 200,
+    borderRadius: 10,
+  },
+  messageFooter: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    marginTop: 5,
+  },
+  messageTime: {
+    color: "white",
+    fontSize: 12,
+    marginRight: 5,
+  },
+  statusIcon: {
+    flexDirection: "row",
+    marginLeft: 5,
+  },
+  inputContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 10,
+    backgroundColor: "#252762",
+    borderTopWidth: 1,
+    borderTopColor: "#fff",
+    minHeight: 60, // Ensure minimum height for the input container
+  },
+  input: {
+    flex: 1,
+    backgroundColor: "rgba(255, 255, 255, 0.1)",
+    color: "white",
+    borderRadius: 20,
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+    maxHeight: 100,
+    minHeight: 40, // Ensure minimum height for the input
+  },
+  sendButton: {
+    marginLeft: 10,
+    padding: 10,
+    borderRadius: 20,
+    minWidth: 44, // Ensure minimum width for the send button
+    minHeight: 44, // Ensure minimum height for the send button
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  sendButtonActive: {
+    backgroundColor: "#4A80F0",
+  },
+  sendButtonInactive: {
+    backgroundColor: "rgba(255, 255, 255, 0.1)",
+  },
+  attachmentButton: {
+    marginRight: 10,
+    padding: 10,
+  },
+  modal: {
+    margin: 0,
+  },
+  modalContent: {
+    flex: 1,
+    backgroundColor: "black",
+  },
+  modalCloseButton: {
+    position: "absolute",
+    top: 40,
+    right: 20,
+    backgroundColor: "rgba(0, 0, 0, 0.5)",
+    borderRadius: 20,
+    padding: 10,
+  },
+  imageOptionsModal: {
+    justifyContent: "flex-end",
+    margin: 0,
+  },
+  imageOptionsContainer: {
+    backgroundColor: "#252762",
+    padding: 20,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+  },
+  imageOption: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 15,
+    borderBottomWidth: 0.5,
+    borderBottomColor: "rgba(255,255,255,0.1)",
+  },
+  imageOptionText: {
+    color: "white",
+    fontSize: 16,
+    marginLeft: 15,
+  },
+  cancelOption: {
+    borderTopWidth: 0.5,
+    borderTopColor: "rgba(255,255,255,0.1)",
+    marginTop: 10,
+    paddingTop: 10,
+  },
+  width24: {
+    width: 24,
+  },
+  deleteModalContainer: {
+    justifyContent: "flex-end",
+    margin: 0,
+  },
+  deleteModalContent: {
+    backgroundColor: "#252762",
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    padding: 20,
+    paddingBottom: 30,
+  },
+  deleteModalTitle: {
+    color: "white",
+    fontSize: 18,
+    fontWeight: "600",
+    marginBottom: 20,
+    textAlign: "center",
+  },
+  deleteOption: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 15,
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(255,255,255,0.1)",
+  },
+  deleteOptionText: {
+    color: "#FF3B30",
+    fontSize: 16,
+    marginLeft: 15,
+    fontWeight: "500",
+  },
+  cancelOption: {
+    alignItems: "center",
+    paddingVertical: 15,
+    marginTop: 10,
+  },
+  cancelOptionText: {
+    color: "#4A80F0",
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  invalidMessageText: {
+    fontStyle: "italic",
+    color: "#888",
+    fontSize: 14,
+  },
+});
+
+export default ChatScreen;

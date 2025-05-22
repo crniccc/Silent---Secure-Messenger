@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "cors": "^2.8.5",
+    "list": "^2.0.19",
+    "react-native-gesture-handler": "^2.25.0"
+  }
+}
