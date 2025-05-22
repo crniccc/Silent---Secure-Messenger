@@ -2,7 +2,7 @@
 
 Silent is a modern, high-security messaging application that implements state-of-the-art cryptographic protocols to ensure your conversations remain private, secure, and only accessible to you and your intended recipients.
 
-![Silent App Logo](assets/logo.png)
+![Silent App Logo](client/assets/logo.png)
 
 ## Features
 
