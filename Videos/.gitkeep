@@ -1,3 +1,2 @@
 # This directory contains sample videos for the Silent app
-# Supported formats: MP4, MOV
-# Max file size: 5MB 
+# Supported formats: '.mp4', '.avi', '.mov', '.mkv', '.webm', '.wmv', '.flv', '.m4v'
