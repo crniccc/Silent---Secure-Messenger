@@ -4,7 +4,6 @@
 *.pem
 *.bak
 *.mobileconfig
-Videos/.gitkeep
 *.mp4
 *.mov
 *.sh
