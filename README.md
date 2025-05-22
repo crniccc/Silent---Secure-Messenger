@@ -21,7 +21,7 @@ Silent implements multiple layers of security:
 
 - **X3DH (Extended Triple Diffie-Hellman)** for secure key exchange and initial authentication
 - **Double Ratchet Algorithm** (same protocol used by Signal) for perfect forward secrecy
-- **XSalsa20** encryption for message content with 256-bit keys
+- **XSalsa20-Poly1305** encryption for message content with 256-bit keys
 - **Enhanced Entropy** using Python-seeded random number generation
 - **NaCl/TweetNaCl** cryptographic library for proven security primitives
 - **Message Self-Destruction** once read and acknowledged
@@ -54,7 +54,6 @@ Silent implements multiple layers of security:
 Silent supports the following media formats for secure sharing:
 
 - Images: JPEG, PNG
-- Videos: MP4, MOV (up to 5MB)
 
 ## Getting Started
 
@@ -71,30 +70,25 @@ Silent supports the following media formats for secure sharing:
 
 #### 1. Setup the Entropy Server (PyRand)
 
-1. Navigate to the PyRand directory
 
-   ```
-   cd PyRand
-   ```
-
-2. Create a Videos directory for entropy sources
+1. Create a Videos directory for entropy sources
 
    ```
    mkdir -p Videos
    ```
 
-3. Add video files to the Videos directory
+2. Add video files to the Videos directory
 
    - Supported formats: .mp4, .avi, .mov, .mkv, .webm, .wmv, .flv, .m4v
    - These videos will be used for entropy generation
 
-4. Install required Python packages
+3. Install required Python packages
 
    ```
    pip install flask flask-cors opencv-python numpy
    ```
 
-5. Start the entropy server
+4. Start the entropy server
 
    ```
    python entropy_server.py
