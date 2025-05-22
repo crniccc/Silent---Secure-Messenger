@@ -43,6 +43,12 @@ Silent implements multiple layers of security:
 - Socket.io for real-time messaging
 - JWT for authentication
 
+### Entropy Server
+
+- Python Flask server
+- Video-based entropy generation
+- Hardware sensors for additional entropy
+
 ## Supported Media Formats
 
 Silent supports the following media formats for secure sharing:
@@ -57,18 +63,51 @@ Silent supports the following media formats for secure sharing:
 - Node.js (v14 or higher)
 - npm or yarn
 - MongoDB (v4.4 or higher)
+- Python 3.8+ with pip (for entropy server)
 - Expo CLI (`npm install -g expo-cli`)
 - Android Studio (for Android development) or Xcode (for iOS development)
 
 ### Installation
 
-#### Server Setup
+#### 1. Setup the Entropy Server (PyRand)
 
-1. Clone the repository
+1. Navigate to the PyRand directory
 
    ```
-   git clone https://github.com/your-username/Silent.git
-   cd Silent/server
+   cd PyRand
+   ```
+
+2. Create a Videos directory for entropy sources
+
+   ```
+   mkdir -p Videos
+   ```
+
+3. Add video files to the Videos directory
+
+   - Supported formats: .mp4, .avi, .mov, .mkv, .webm, .wmv, .flv, .m4v
+   - These videos will be used for entropy generation
+
+4. Install required Python packages
+
+   ```
+   pip install flask flask-cors opencv-python numpy
+   ```
+
+5. Start the entropy server
+
+   ```
+   python entropy_server.py
+   ```
+
+   The entropy server will run on http://0.0.0.0:5000
+
+#### 2. Server Setup
+
+1. Navigate to the server directory
+
+   ```
+   cd server
    ```
 
 2. Install dependencies
@@ -77,13 +116,7 @@ Silent supports the following media formats for secure sharing:
    npm install
    ```
 
-3. Create SSL certificates (for local development)
-
-   ```
-   ./generate-ssl.sh
-   ```
-
-4. Set up environment variables
+3. Set up environment variables
    Create a `.env` file in the server directory with the following variables:
 
    ```
@@ -93,17 +126,20 @@ Silent supports the following media formats for secure sharing:
    NODE_ENV=development
    ```
 
-5. Start the server
+4. Start the server
+
    ```
-   npm start
+   npm run dev
    ```
 
-#### Client Setup
+   The server will run on http://0.0.0.0:3000
+
+#### 3. Client Setup
 
 1. Navigate to the client directory
 
    ```
-   cd ../client
+   cd client
    ```
 
 2. Install dependencies
@@ -112,16 +148,13 @@ Silent supports the following media formats for secure sharing:
    npm install
    ```
 
-3. Configure the application
-   Edit `src/config/config.js` to point to your server address
-
-4. Start the Expo development server
+3. Start the Expo development server
 
    ```
-   expo start
+   npx expo start
    ```
 
-5. Run on device or emulator
+4. Run on device or emulator
    - Press 'a' to run on Android emulator
    - Press 'i' to run on iOS simulator
    - Or scan the QR code with the Expo Go app on your device
