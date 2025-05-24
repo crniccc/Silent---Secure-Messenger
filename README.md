@@ -158,7 +158,7 @@ Silent supports the following media formats for secure sharing:
 1. **Registration**: Create a new account using a username and password
 2. **Adding Contacts**: Search for users and send contact requests
 3. **Messaging**: Start encrypted conversations with accepted contacts
-4. **Media Sharing**: Share images and videos securely
+4. **Media Sharing**: Share images securely
 5. **Message Status**: Track when messages are sent, delivered, and seen
 
 ## Security Considerations
@@ -177,10 +177,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-## Acknowledgments
-
-- Signal Protocol for inspiration on the Double Ratchet Algorithm
-- The TweetNaCl.js team for their lightweight cryptographic library
-- The Expo team for their secure storage solutions
-
----
